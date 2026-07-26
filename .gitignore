@@ -1,0 +1,18 @@
+backend/.venv/
+backend/*.egg-info/
+**/__pycache__/
+*.py[cod]
+
+frontend/node_modules/
+frontend/dist/
+
+.env
+.runtime/
+logs/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local test environment inventory and live cluster overrides
+docs/test-environment.md
+deploy/k8s/observability-nodeports.yaml

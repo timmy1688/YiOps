@@ -1,0 +1,81 @@
+# Copy this file to observability-nodeports.yaml, then replace 192.0.2.10/32
+# with the YiOps server's source IP in CIDR notation before applying it.
+apiVersion: v1
+kind: Service
+metadata:
+  name: yiops-prometheus-nodeport
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/part-of: yiops
+spec:
+  type: NodePort
+  externalTrafficPolicy: Local
+  selector:
+    prometheus: k8s
+  ports:
+    - name: http
+      protocol: TCP
+      port: 9090
+      targetPort: web
+      nodePort: 30900
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: yiops-prometheus-ingress
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/part-of: yiops
+spec:
+  podSelector:
+    matchLabels:
+      prometheus: k8s
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - ipBlock:
+            cidr: 192.0.2.10/32
+      ports:
+        - protocol: TCP
+          port: 9090
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: yiops-loki-nodeport
+  namespace: yiops-observability
+  labels:
+    app.kubernetes.io/part-of: yiops
+spec:
+  type: NodePort
+  externalTrafficPolicy: Local
+  selector:
+    app: loki
+  ports:
+    - name: http
+      protocol: TCP
+      port: 3100
+      targetPort: http
+      nodePort: 31100
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: yiops-loki-ingress
+  namespace: yiops-observability
+  labels:
+    app.kubernetes.io/part-of: yiops
+spec:
+  podSelector:
+    matchLabels:
+      app: loki
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - ipBlock:
+            cidr: 192.0.2.10/32
+      ports:
+        - protocol: TCP
+          port: 3100
