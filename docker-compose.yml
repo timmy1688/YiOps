@@ -1,0 +1,59 @@
+services:
+  mysql:
+    image: mysql:8.4
+    restart: unless-stopped
+    environment:
+      MYSQL_DATABASE: ${MYSQL_DATABASE:?Set MYSQL_DATABASE in .env.docker}
+      MYSQL_USER: ${MYSQL_USER:?Set MYSQL_USER in .env.docker}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:?Set MYSQL_PASSWORD in .env.docker}
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?Set MYSQL_ROOT_PASSWORD in .env.docker}
+    volumes:
+      - mysql_data:/var/lib/mysql
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "mysqladmin ping -h 127.0.0.1 -u root -p$$MYSQL_ROOT_PASSWORD --silent",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+    networks:
+      - backend
+
+  yiops:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: yiops:local
+    restart: unless-stopped
+    init: true
+    depends_on:
+      mysql:
+        condition: service_healthy
+    environment:
+      YIOPS_DATABASE_URL: mysql://${MYSQL_USER:?Set MYSQL_USER in .env.docker}:${MYSQL_PASSWORD:?Set MYSQL_PASSWORD in .env.docker}@mysql:3306/${MYSQL_DATABASE:?Set MYSQL_DATABASE in .env.docker}?charset=utf8mb4
+      YIOPS_AUTO_CREATE_TABLES: "true"
+      YIOPS_DATASOURCE_MOCK_MODE: ${YIOPS_DATASOURCE_MOCK_MODE:-false}
+      YIOPS_LLM_MOCK_MODE: ${YIOPS_LLM_MOCK_MODE:-true}
+    ports:
+      - "${YIOPS_BIND_ADDRESS:-127.0.0.1}:${YIOPS_PORT:-8100}:8100"
+    volumes:
+      - runtime_data:/app/.runtime
+      - logs_data:/app/logs
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    networks:
+      - backend
+
+volumes:
+  mysql_data:
+  runtime_data:
+  logs_data:
+
+networks:
+  backend:
+    internal: false
