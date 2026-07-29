@@ -5,6 +5,8 @@ from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request, Response, status
 from fastapi.responses import StreamingResponse
+from tortoise.exceptions import IntegrityError
+from tortoise.transactions import in_transaction
 
 from app.config import get_settings
 from app.llm.deepseek import DeepSeekClient
@@ -54,9 +56,19 @@ async def health() -> dict[str, str]:
 
 
 @router.post("/webhooks/alertmanager", status_code=status.HTTP_202_ACCEPTED)
-async def alertmanager_webhook(payload: dict[str, Any]) -> dict[str, Any]:
+async def alertmanager_webhook(
+    payload: dict[str, Any],
+    request: Request,
+) -> dict[str, Any]:
     incidents = await ingest_alertmanager(payload)
-    return {"incident_ids": list(dict.fromkeys(incident.id for incident in incidents))}
+    analysis_run_ids = await _enqueue_analysis_runs(
+        request,
+        _firing_incidents(payload, incidents),
+    )
+    return {
+        "incident_ids": list(dict.fromkeys(incident.id for incident in incidents)),
+        "analysis_run_ids": analysis_run_ids,
+    }
 
 
 @router.get("/integrations", response_model=list[AlertIntegrationRead])
@@ -71,12 +83,10 @@ async def list_integrations() -> list[AlertIntegrationRead]:
     status_code=status.HTTP_201_CREATED,
 )
 async def create_integration(payload: AlertIntegrationCreate) -> AlertIntegrationRead:
-    values = payload.model_dump(exclude={"auto_analyze"})
     item = await AlertIntegration.create(
         id=new_id("integration"),
         webhook_token=secrets.token_urlsafe(24),
-        auto_analyze=False,
-        **values,
+        **payload.model_dump(),
     )
     return _integration_read(item)
 
@@ -89,10 +99,9 @@ async def update_integration(
     item = await AlertIntegration.get_or_none(id=integration_id)
     if item is None:
         raise HTTPException(status_code=404, detail="Integration not found")
-    values = payload.model_dump(exclude_unset=True, exclude={"auto_analyze"})
+    values = payload.model_dump(exclude_unset=True)
     for key, value in values.items():
         setattr(item, key, value)
-    item.auto_analyze = False
     await item.save()
     return _integration_read(item)
 
@@ -117,6 +126,7 @@ async def integration_webhook(
     integration_id: str,
     token: str,
     payload: dict[str, Any],
+    request: Request,
 ) -> dict[str, Any]:
     item = await AlertIntegration.get_or_none(id=integration_id, webhook_token=token)
     if item is None:
@@ -130,6 +140,14 @@ async def integration_webhook(
         default_namespace=item.default_namespace,
     )
     incident_ids = list(dict.fromkeys(incident.id for incident in incidents))
+    analysis_run_ids = (
+        await _enqueue_analysis_runs(
+            request,
+            _firing_incidents(payload, incidents),
+        )
+        if item.auto_analyze
+        else []
+    )
 
     item.received_count += len(payload.get("alerts", []))
     item.last_received_at = datetime.now(UTC)
@@ -138,17 +156,117 @@ async def integration_webhook(
     )
     return {
         "incident_ids": incident_ids,
-        "analysis_run_ids": [],
-        "analysis_required": "manual",
+        "analysis_run_ids": analysis_run_ids,
+        "analysis_required": "automatic" if item.auto_analyze else "manual",
     }
 
 
-@router.get(
-    "/model-config",
-    response_model=AnalysisModelConfigRead | None,
+@router.get("/model-configs", response_model=list[AnalysisModelConfigRead])
+async def list_model_configs() -> list[AnalysisModelConfigRead]:
+    items = await AnalysisModelConfig.all().order_by("-enabled", "name")
+    return [_model_config_read(item) for item in items]
+
+
+@router.post(
+    "/model-configs",
+    response_model=AnalysisModelConfigRead,
+    status_code=status.HTTP_201_CREATED,
 )
+async def create_model_config(
+    payload: AnalysisModelConfigUpsert,
+) -> AnalysisModelConfigRead:
+    api_key = payload.api_key.strip() if payload.api_key else ""
+    if not api_key:
+        raise HTTPException(status_code=422, detail="新建渠道必须填写 API Key")
+
+    values = payload.model_dump(exclude={"api_key"})
+    values["base_url"] = str(payload.base_url).rstrip("/")
+    try:
+        async with in_transaction() as connection:
+            if payload.enabled:
+                await AnalysisModelConfig.filter(enabled=True).using_db(connection).update(
+                    enabled=False
+                )
+            item = await AnalysisModelConfig.create(
+                id=new_id("model"),
+                secret_ref=credential_vault.encrypt({"api_key": api_key}),
+                using_db=connection,
+                **values,
+            )
+    except IntegrityError as exc:
+        raise HTTPException(status_code=409, detail="渠道名称已存在") from exc
+    return _model_config_read(item)
+
+
+@router.put("/model-configs/{config_id}", response_model=AnalysisModelConfigRead)
+async def update_model_config(
+    config_id: str,
+    payload: AnalysisModelConfigUpsert,
+) -> AnalysisModelConfigRead:
+    item = await AnalysisModelConfig.get_or_none(id=config_id)
+    if item is None:
+        raise HTTPException(status_code=404, detail="模型渠道不存在")
+
+    api_key = payload.api_key.strip() if payload.api_key else ""
+    if not api_key and not item.secret_ref:
+        raise HTTPException(status_code=422, detail="请填写 API Key")
+    values = payload.model_dump(exclude={"api_key"})
+    values["base_url"] = str(payload.base_url).rstrip("/")
+    connection_changed = bool(api_key) or any(
+        getattr(item, key) != value
+        for key, value in values.items()
+        if key in {"provider", "base_url", "model_name"}
+    )
+    try:
+        async with in_transaction() as connection:
+            if payload.enabled:
+                await (
+                    AnalysisModelConfig.filter(enabled=True)
+                    .exclude(id=config_id)
+                    .using_db(connection)
+                    .update(enabled=False)
+                )
+            for key, value in values.items():
+                setattr(item, key, value)
+            if api_key:
+                item.secret_ref = credential_vault.encrypt({"api_key": api_key})
+            if connection_changed:
+                item.update_from_dict(
+                    {
+                        "last_test_status": None,
+                        "last_test_message": None,
+                        "last_tested_at": None,
+                    }
+                )
+            await item.save(using_db=connection)
+    except IntegrityError as exc:
+        raise HTTPException(status_code=409, detail="渠道名称已存在") from exc
+    return _model_config_read(item)
+
+
+@router.delete("/model-configs/{config_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_model_config(config_id: str) -> Response:
+    deleted = await AnalysisModelConfig.filter(id=config_id).delete()
+    if not deleted:
+        raise HTTPException(status_code=404, detail="模型渠道不存在")
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@router.post("/model-configs/{config_id}/test")
+async def test_model_config_by_id(config_id: str) -> dict[str, Any]:
+    item = await AnalysisModelConfig.get_or_none(id=config_id)
+    if item is None or not item.secret_ref:
+        raise HTTPException(status_code=404, detail="请先保存模型渠道和 API Key")
+    return await _test_model_config(item)
+
+
+# Keep the original single-config endpoints for older clients. They now operate
+# on the active channel, or the first saved channel when none is active.
+@router.get("/model-config", response_model=AnalysisModelConfigRead | None)
 async def get_model_config() -> AnalysisModelConfigRead | None:
-    item = await AnalysisModelConfig.get_or_none(id="default")
+    item = await AnalysisModelConfig.filter(enabled=True).order_by("-updated_at").first()
+    if item is None:
+        item = await AnalysisModelConfig.all().order_by("created_at").first()
     return _model_config_read(item) if item else None
 
 
@@ -156,39 +274,26 @@ async def get_model_config() -> AnalysisModelConfigRead | None:
 async def upsert_model_config(
     payload: AnalysisModelConfigUpsert,
 ) -> AnalysisModelConfigRead:
-    item = await AnalysisModelConfig.get_or_none(id="default")
-    api_key = payload.api_key.strip() if payload.api_key else ""
-    if item is None and not api_key:
-        raise HTTPException(status_code=422, detail="首次配置必须填写 API Key")
-    if item is not None and not api_key and not item.secret_ref:
-        raise HTTPException(status_code=422, detail="请填写 API Key")
-
-    values = payload.model_dump(exclude={"api_key"})
-    values["base_url"] = str(payload.base_url).rstrip("/")
+    item = await AnalysisModelConfig.filter(enabled=True).order_by("-updated_at").first()
     if item is None:
-        item = await AnalysisModelConfig.create(
-            id="default",
-            secret_ref=(credential_vault.encrypt({"api_key": api_key}) if api_key else None),
-            **values,
-        )
-    else:
-        for key, value in values.items():
-            setattr(item, key, value)
-        if api_key:
-            item.secret_ref = credential_vault.encrypt({"api_key": api_key})
-        item.last_test_status = None
-        item.last_test_message = None
-        item.last_tested_at = None
-        await item.save()
-    return _model_config_read(item)
+        item = await AnalysisModelConfig.all().order_by("created_at").first()
+    if item is None:
+        return await create_model_config(payload)
+    return await update_model_config(item.id, payload)
 
 
 @router.post("/model-config/test")
 async def test_model_config() -> dict[str, Any]:
-    item = await AnalysisModelConfig.get_or_none(id="default")
+    item = await AnalysisModelConfig.filter(enabled=True).order_by("-updated_at").first()
+    if item is None:
+        item = await AnalysisModelConfig.all().order_by("created_at").first()
     if item is None or not item.secret_ref:
-        raise HTTPException(status_code=404, detail="请先保存模型配置和 API Key")
-    credential = credential_vault.decrypt(item.secret_ref).get("api_key", "")
+        raise HTTPException(status_code=404, detail="请先保存模型渠道和 API Key")
+    return await _test_model_config(item)
+
+
+async def _test_model_config(item: AnalysisModelConfig) -> dict[str, Any]:
+    credential = credential_vault.decrypt(item.secret_ref or "").get("api_key", "")
     if not credential:
         raise HTTPException(status_code=422, detail="API Key 无法读取，请重新填写")
     try:
@@ -274,7 +379,9 @@ async def create_analysis_run(incident_id: str, request: Request) -> AnalysisRun
 
 
 async def _new_analysis_run(incident_id: str) -> AnalysisRun:
-    configured_model = await AnalysisModelConfig.get_or_none(id="default", enabled=True)
+    configured_model = (
+        await AnalysisModelConfig.filter(enabled=True).order_by("-updated_at").first()
+    )
     model_name = (
         configured_model.model_name
         if configured_model and configured_model.secret_ref
@@ -291,6 +398,38 @@ async def _new_analysis_run(incident_id: str) -> AnalysisRun:
         progress=0,
         model_name=model_name,
     )
+
+
+async def _enqueue_analysis_runs(
+    request: Request,
+    incidents: list[Incident],
+) -> list[str]:
+    run_ids: list[str] = []
+    seen_incidents: set[str] = set()
+    for incident in incidents:
+        if incident.id in seen_incidents or incident.status != "open":
+            continue
+        seen_incidents.add(incident.id)
+        existing = await AnalysisRun.filter(incident_id=incident.id).exists()
+        if existing:
+            continue
+        run = await _new_analysis_run(incident.id)
+        await request.app.state.supervisor.enqueue(run.id)
+        run_ids.append(run.id)
+    return run_ids
+
+
+def _firing_incidents(
+    payload: dict[str, Any],
+    incidents: list[Incident],
+) -> list[Incident]:
+    raw_alerts = payload.get("alerts", [])
+    return [
+        incident
+        for incident, raw in zip(incidents, raw_alerts, strict=False)
+        if str(raw.get("status", payload.get("status", "firing"))).lower()
+        not in {"resolved", "closed"}
+    ]
 
 
 @router.get("/analysis-runs/{run_id}", response_model=AnalysisRunRead)
@@ -532,7 +671,7 @@ def _integration_read(item: AlertIntegration) -> AlertIntegrationRead:
         webhook_path=(f"{settings.api_prefix}/integrations/{item.id}/webhook/{item.webhook_token}"),
         default_cluster=item.default_cluster,
         default_namespace=item.default_namespace,
-        auto_analyze=False,
+        auto_analyze=item.auto_analyze,
         enabled=item.enabled,
         received_count=item.received_count,
         last_received_at=item.last_received_at,

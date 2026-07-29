@@ -31,6 +31,10 @@ class SPAStaticFiles(StaticFiles):
         except HTTPException as exc:
             if exc.status_code != 404:
                 raise
+            # API typos or frontend/backend version mismatches must stay 404s.
+            # Returning index.html here makes API clients treat HTML as JSON.
+            if path == "api" or path.startswith("api/"):
+                raise
             return FileResponse(Path(self.directory) / "index.html")
 
 

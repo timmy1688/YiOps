@@ -37,6 +37,7 @@ const steps = [
   { key: 'plan', title: '调查规划' },
   { key: 'collect', title: '并行采集' },
   { key: 'compress', title: '证据压缩' },
+  { key: 'refine', title: '缺口补证' },
   { key: 'analyze', title: '根因分析' },
   { key: 'validate', title: '报告验证' },
   { key: 'save', title: '完成' },

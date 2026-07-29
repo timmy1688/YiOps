@@ -7,16 +7,19 @@ YiOps MVP 采用一套精简的证据驱动 Agent：
 ```text
 Vue 3
   + FastAPI 单服务
-  + LangGraph 七节点固定流程
-  + DeepSeek V4 Pro 单模型
+  + LangGraph 八节点固定流程
+  + DeepSeek / OpenAI Compatible 多模型渠道
   + MySQL
   + Prometheus / Loki / Elasticsearch
 ```
 
-一次分析只调用模型两次：
+一次正常分析调用模型三次：
 
 1. 生成受控调查计划；
-2. 根据证据生成结构化根因报告。
+2. 进行一次证据缺口复核；
+3. 根据证据生成结构化根因报告。
+
+报告引用校验失败时，允许同一模型额外修正一次。
 
 MVP 不使用：
 
@@ -24,7 +27,7 @@ MVP 不使用：
 - 多Agent；
 - 无限ReAct；
 - 独立Critic模型调用；
-- 自动补证循环；
+- 无限自动补证循环；
 - 长期记忆和历史事故RAG；
 - 向量数据库；
 - MCP；
@@ -34,6 +37,7 @@ MVP 不使用：
 保留的关键能力：
 
 - 数据源并行采集；
+- 单次受控补证；
 - 预定义查询模板；
 - Python证据压缩；
 - 结构化模型输出；
@@ -83,7 +87,7 @@ MVP 不使用：
 
 暂不包含：
 
-- Kubernetes Event、CMDB和发布变更；
+- CMDB和发布变更；
 - 自动服务拓扑推断；
 - 历史事故知识库；
 - 多租户复杂权限；
@@ -100,7 +104,7 @@ flowchart TB
     GRAPH --> PROM[Prometheus]
     GRAPH --> LOKI[Loki]
     GRAPH --> ES[Elasticsearch]
-    GRAPH --> DS[DeepSeek V4 Pro]
+    GRAPH --> DS[DeepSeek / OpenAI Compatible]
     APP -- REST / SSE --> UI
 ```
 
@@ -116,25 +120,30 @@ Prometheus、Loki和Elasticsearch使用现有环境。
 
 ## 5. Agent执行过程
 
-### 5.1 七个节点
+本节给出架构摘要，当前代码的完整触发条件、节点输入输出、置信度校准、失败恢复和
+Incident 关闭逻辑见 [Agent 分析流程](./docs/agent-analysis-flow.md)。
+
+### 5.1 八个节点
 
 ```mermaid
 flowchart LR
     A[1 告警标准化] --> B[2 调查规划]
     B --> C[3 并行采集]
     C --> D[4 证据压缩]
-    D --> E[5 根因分析]
-    E --> F[6 报告验证]
-    F --> G[7 保存与展示]
+    D --> E[5 证据缺口复核]
+    E --> F[6 根因分析]
+    F --> G[7 报告验证]
+    G --> H[8 保存与展示]
 ```
 
 | 节点 | 执行者 | 作用 | 模型调用 |
 |---|---|---|---|
 | 告警标准化 | Python | 识别服务、实例、时间窗和告警类型 | 否 |
-| 调查规划 | DeepSeek | 从有限查询包中选择需要调查的方向 | 第1次 |
-| 并行采集 | Python | 并行查询三个数据源 | 否 |
+| 调查规划 | 模型 | 从有限查询包中选择需要调查的方向 | 第1次 |
+| 并行采集 | Python | 并行查询 Prometheus、Loki、Kubernetes 和 Elasticsearch | 否 |
 | 证据压缩 | Python | 异常计算、日志聚类、脱敏和Evidence生成 | 否 |
-| 根因分析 | DeepSeek | 生成候选根因、证据引用和建议 | 第2次 |
+| 证据缺口复核 | 模型 | 按需选择尚未使用的 QueryPack 补证一次 | 第2次 |
+| 根因分析 | 模型 | 生成候选根因、证据引用和建议 | 第3次 |
 | 报告验证 | Python | 验证证据ID、时间顺序和输出Schema | 否 |
 | 保存与展示 | Python | 写入MySQL并通过SSE通知Vue | 否 |
 
@@ -146,7 +155,7 @@ sequenceDiagram
     participant API as FastAPI
     participant DB as MySQL
     participant G as LangGraph
-    participant LLM as DeepSeek V4 Pro
+    participant LLM as DeepSeek / OpenAI Compatible
     participant T as 数据源
     participant UI as Vue
 
@@ -162,10 +171,18 @@ sequenceDiagram
     and
         G->>T: Loki
     and
+        G->>T: Kubernetes API
+    and
         G->>T: Elasticsearch
     end
     T-->>G: 原始查询结果
     G->>G: Python分析并生成Evidence
+    G->>LLM: 复核证据缺口
+    opt 需要补证
+        G->>T: 执行新增QueryPack
+        T-->>G: 补充查询结果
+        G->>G: 生成补充Evidence
+    end
     G->>LLM: Evidence包
     LLM-->>G: 结构化根因报告
     G->>G: 确定性验证
@@ -191,8 +208,9 @@ sequenceDiagram
 
 默认时间窗：
 
-- 基线：告警前60分钟到前10分钟；
-- 故障：告警前10分钟到后30分钟。
+- 开始：告警开始时间前60分钟；
+- 结束：至少覆盖告警开始后30分钟；
+- 上限：不超过告警开始后6小时。
 
 ### 5.4 调查规划
 
@@ -205,6 +223,7 @@ instance_health      Pod重启、实例数和健康状态
 dependency_health    下游错误率和延迟
 database_symptom     连接池、数据库超时日志
 application_errors   ERROR/WARN和异常堆栈
+kubernetes_cluster   Pod、工作负载、节点、Event、重启和错误日志
 ```
 
 模型输出：
@@ -223,7 +242,7 @@ Python将查询包映射为预定义模板。模型不选择数据源地址，�
 
 ### 5.5 并行采集
 
-程序根据查询包并行执行：
+程序根据查询包并行执行 Prometheus、Loki、Kubernetes API 和 Elasticsearch：
 
 ```python
 await asyncio.gather(
@@ -328,17 +347,16 @@ MVP不增加独立Critic调用。是否需要Critic由真实故障评测结果�
 
 ## 6. 模型方案
 
-只使用：
+Web 界面支持配置多个 OpenAI Compatible 模型渠道，同时保留历史 DeepSeek
+provider 配置。一次运行使用创建任务时选中的当前渠道；未配置外部模型时回退到
+本地规则模式。
 
-```env
-DEEPSEEK_MODEL=deepseek-v4-pro
-```
-
-两次调用使用不同模式：
+三次正常调用使用不同任务提示：
 
 | 调用 | 模式 | 原因 |
 |---|---|---|
 | 调查规划 | thinking disabled | 任务简单，降低延迟 |
+| 证据缺口复核 | thinking disabled | 只判断是否需要新增 QueryPack |
 | 根因分析 | thinking enabled / high | 需要复杂证据关联 |
 
 统一使用JSON Output和Pydantic校验。不保存或展示模型内部推理过程。
@@ -415,11 +433,11 @@ MVP不让模型直接调用大量底层工具，而是采用：
 
 | 技术 | 作用 | YiOps中的应用 |
 |---|---|---|
-| Stateful Workflow | 显式控制执行顺序和状态 | LangGraph七节点流程 |
+| Stateful Workflow | 显式控制执行顺序和状态 | LangGraph八节点流程 |
 | Plan-and-Execute | 分离调查决策与工具执行 | 模型选QueryPack，Python执行 |
 | Structured Output | 将模型结果变成可校验对象 | JSON Output和Pydantic |
 | Controlled Tools | 限制模型的数据访问能力 | QueryPack、模板和Policy Guard |
-| Fan-out/Fan-in | 降低多数据源采集耗时 | 三类数据源并行查询 |
+| Fan-out/Fan-in | 降低多数据源采集耗时 | 四类数据源并行查询 |
 | Evidence Grounding | 防止无证据结论 | 报告强制引用Evidence ID |
 | Context Engineering | 控制模型输入质量和长度 | Top K Evidence和32K预算 |
 | Agent Observability | 支持调试、审计和评测 | 节点、查询、Token和引用记录 |
@@ -461,7 +479,7 @@ MVP只做三个页面。
 展示：
 
 - 告警信息；
-- Agent七节点进度；
+- Agent八节点进度；
 - 指标异常；
 - 日志模式；
 - 根因假设；
@@ -557,8 +575,8 @@ YiOps/
 
 ### 第三阶段：Agent
 
-- LangGraph七节点流程；
-- DeepSeek两次调用；
+- LangGraph八节点流程；
+- 模型规划、单次补证复核和根因分析；
 - 结构化报告和确定性验证；
 - 应用内任务执行和恢复；
 - SSE进度。
@@ -575,8 +593,8 @@ YiOps/
 
 1. Alertmanager告警能够创建或合并Incident；
 2. 单服务Incident可以完成一次端到端分析；
-3. 一次正常分析只调用模型两次；
-4. 三类数据源只能通过预定义模板查询；
+3. 一次正常分析调用模型三次，报告校验失败时最多额外修正一次；
+4. 四类数据源只能通过预定义模板查询；
 5. 原始大批量日志不会发送给模型；
 6. 每个根因结论可以定位到真实Evidence；
 7. 不存在的Evidence引用不能进入报告；
@@ -594,7 +612,7 @@ YiOps/
 |---|---|
 | Redis和独立Worker | 需要多实例或更高分析并发 |
 | Critic | 历史评测显示过度因果或错误结论较多 |
-| 自动补证循环 | 固定查询包的证据覆盖率不足 |
+| 多轮自动补证循环 | 单次受控补证的证据覆盖率仍不足 |
 | Kubernetes/发布事件 | 日志指标无法解释主要故障 |
 | 历史事故RAG | 已积累足够人工确认的故障案例 |
 | MCP | 工具需要被多个Agent或系统复用 |

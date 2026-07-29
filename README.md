@@ -9,10 +9,10 @@ Kubernetes，只把压缩后的证据交给大模型，最终生成带证据引�
 ## 主要能力
 
 - 接收 Alertmanager Webhook，自动归并和去重告警；
-- 支持手动创建事件并发起分析；
+- 自动聚合 Alertmanager 告警，并可按接入渠道配置自动或手动发起分析；
 - 接入 Prometheus、Loki、Elasticsearch 和 Kubernetes 数据源；
-- 在 Web 界面维护 DeepSeek 或 OpenAI Compatible 模型；
-- 使用固定调查流程生成查询计划、采集证据和根因报告；
+- 在 Web 界面维护 DeepSeek 及其他 OpenAI Compatible 模型渠道并随时切换；
+- 使用受控的八节点流程规划查询、补充缺失证据并生成根因报告；
 - 展示分析进度、工具调用、原始证据和证据引用；
 - 对模型密钥及数据源凭据进行本地加密存储；
 - 支持分析失败重试和报告反馈。
@@ -29,12 +29,25 @@ flowchart LR
     AGENT --> LOKI[Loki]
     AGENT --> ES[Elasticsearch]
     AGENT --> K8S[Kubernetes API]
-    AGENT --> LLM[DeepSeek / OpenAI Compatible]
+    AGENT --> LLM[DeepSeek / OpenAI Compatible 多渠道]
 ```
 
 后端采用 Python 3.12、FastAPI、LangGraph、Tortoise ORM；前端采用 Vue 3、
 TypeScript、Vite 和 Element Plus。更完整的设计说明见
 [YiOps MVP 技术落地方案](./YiOps-MVP技术落地方案.md)。
+
+## Agent 分析流程
+
+当前 Agent 使用固定的八节点流程：
+
+```text
+normalize → plan → collect → compress → refine → analyze → validate → save
+```
+
+模型只负责选择受控 QueryPack、进行一次证据缺口复核和生成结构化报告；实际
+PromQL、LogQL、Kubernetes API 查询、证据压缩、引用验证和置信度校准均由
+Python 执行。完整的触发条件、节点输入输出、证据模型、失败恢复及 Incident
+关闭流程见 [Agent 分析流程](./docs/agent-analysis-flow.md)。
 
 ## 界面功能
 
@@ -42,7 +55,7 @@ TypeScript、Vite 和 Element Plus。更完整的设计说明见
 - **分析详情**：查看调查步骤、证据、模型结论和处置建议；
 - **数据源**：添加数据源、配置只读凭据并测试连通性；
 - **告警接入**：生成独立的 Alertmanager Webhook 地址；
-- **模型接入**：配置模型地址、模型名称和 API Key，并执行连接测试。
+- **模型接入**：维护多个模型渠道、测试连接并选择当前分析渠道。
 
 ## 快速开始
 
@@ -182,10 +195,10 @@ Vite 开发服务器默认运行在 `http://127.0.0.1:5173`，并把 `/api` 请�
 
 推荐在 Web 界面的“模型接入”中配置：
 
-1. 选择 DeepSeek 或 OpenAI Compatible；
-2. 填写 Base URL、模型名称和 API Key；
-3. 点击“测试连接”；
-4. 测试成功后启用该配置。
+1. 添加一个或多个 DeepSeek 或其他 OpenAI Compatible 模型渠道；
+2. 为每个渠道填写 Base URL、模型名称和 API Key；
+3. 点击“测试连接”验证渠道；
+4. 将需要使用的渠道设为当前渠道（同一时间只会启用一个）。
 
 API Key 不会返回给前端，后端会使用 `.runtime/credential.key` 加密后再保存。
 该密钥文件不进入 Git，但迁移实例时需要通过安全渠道单独备份。
@@ -242,8 +255,10 @@ receivers:
         send_resolved: true
 ```
 
-保存后发送一条测试告警，即可在“告警事件”页面查看并点击“开始分析”。如果集成
-收到 firing 告警，会先创建或更新事件，分析任务由用户在事件页面手动启动。
+保存后发送一条测试告警，即可在“告警事件”页面查看。接入渠道默认开启自动分析：
+收到 firing 告警后会创建或更新 Incident，并自动启动一次分析；关闭
+`auto_analyze` 后，才需要在 Incident 页面手动点击“开始分析”。resolved 告警
+只更新告警和 Incident 状态，不会触发新的分析。
 
 ## 代码检查
 
@@ -274,6 +289,7 @@ npm run build
 YiOps/
 ├── backend/                  # FastAPI、Agent、连接器与数据模型
 ├── frontend/                 # Vue 3 Web 界面
+├── docs/                     # Agent 流程和测试环境文档
 ├── deploy/k8s/              # Kubernetes 示例清单
 ├── .env.example             # 脱敏的环境变量模板
 ├── .env.docker.example      # Docker Compose 环境变量模板

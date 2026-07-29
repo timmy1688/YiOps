@@ -110,6 +110,30 @@ spec:
       port: 3100
       targetPort: http
 ---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: yiops-loki-ingress
+  namespace: yiops-observability
+  labels:
+    app.kubernetes.io/part-of: yiops
+spec:
+  podSelector:
+    matchLabels:
+      app: loki
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        # External access is added by the local, ignored
+        # observability-nodeports.yaml overlay.
+        - podSelector:
+            matchLabels:
+              app: alloy
+      ports:
+        - protocol: TCP
+          port: 3100
+---
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -147,10 +171,28 @@ data:
   config.alloy: |
     discovery.kubernetes "pods" {
       role = "pod"
+
+      // Run Alloy as a DaemonSet and let every replica open streams only for
+      // Pods on its own node. This prevents a single client from exhausting
+      // the Kubernetes API rate limit while starting all cluster log streams.
+      selectors {
+        role  = "pod"
+        field = "spec.nodeName=" + sys.env("NODE_NAME")
+      }
     }
 
     discovery.relabel "pod_logs" {
       targets = discovery.kubernetes.pods.targets
+
+      // Reading logs through the Kubernetes API for terminated Pods caused
+      // Alloy to reopen hundreds of stale streams, hit client-side rate
+      // limits, and overload the local Loki writer. Active Pods include
+      // CrashLoopBackOff containers because their Pod phase remains Running.
+      rule {
+        source_labels = ["__meta_kubernetes_pod_phase"]
+        regex         = "Running"
+        action        = "keep"
+      }
 
       rule {
         source_labels = ["__meta_kubernetes_namespace"]
@@ -168,7 +210,22 @@ data:
       }
 
       rule {
-        source_labels = ["__meta_kubernetes_pod_label_app"]
+        source_labels = [
+          "__meta_kubernetes_pod_label_service",
+          "__meta_kubernetes_pod_label_app",
+        ]
+        regex         = "([^;]+);.*"
+        replacement   = "$1"
+        target_label  = "service"
+      }
+
+      rule {
+        source_labels = [
+          "__meta_kubernetes_pod_label_service",
+          "__meta_kubernetes_pod_label_app",
+        ]
+        regex         = ";(.+)"
+        replacement   = "$1"
         target_label  = "service"
       }
     }
@@ -194,14 +251,13 @@ data:
     }
 ---
 apiVersion: apps/v1
-kind: Deployment
+kind: DaemonSet
 metadata:
   name: alloy
   namespace: yiops-observability
   labels:
     app: alloy
 spec:
-  replicas: 1
   selector:
     matchLabels:
       app: alloy
@@ -210,8 +266,10 @@ spec:
       labels:
         app: alloy
     spec:
+      # Application Pods run on worker nodes; keep the log agent away from
+      # tainted control-plane nodes.
       nodeSelector:
-        kubernetes.io/hostname: k8s-node2
+        kubernetes.io/os: linux
       serviceAccountName: alloy
       containers:
         - name: alloy
@@ -225,6 +283,11 @@ spec:
           ports:
             - name: http
               containerPort: 12345
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
           readinessProbe:
             httpGet:
               path: /-/ready

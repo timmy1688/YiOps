@@ -150,16 +150,6 @@ export interface AnalysisModelConfigInput {
   enabled: boolean
 }
 
-export interface ManualIncident {
-  alert_name: string
-  service: string
-  cluster?: string
-  namespace?: string
-  instance?: string
-  severity: 'info' | 'warning' | 'critical'
-  started_at: string
-}
-
 const api = axios.create({
   baseURL: '/api/v1',
   timeout: 20_000,
@@ -168,8 +158,6 @@ const api = axios.create({
 export const listIncidents = async () => (await api.get<Incident[]>('/incidents')).data
 export const getIncident = async (id: string) =>
   (await api.get<Incident>(`/incidents/${id}`)).data
-export const createIncident = async (payload: ManualIncident) =>
-  (await api.post<Incident>('/incidents', payload)).data
 export const startAnalysis = async (incidentId: string) =>
   (await api.post<AnalysisRun>(`/incidents/${incidentId}/analysis-runs`)).data
 export const getRun = async (runId: string) =>
@@ -200,12 +188,19 @@ export const updateIntegration = async (
 export const deleteIntegration = async (id: string) => {
   await api.delete(`/integrations/${id}`)
 }
-export const getModelConfig = async () =>
-  (await api.get<AnalysisModelConfig | null>('/model-config')).data
-export const saveModelConfig = async (payload: AnalysisModelConfigInput) =>
-  (await api.put<AnalysisModelConfig>('/model-config', payload)).data
-export const testModelConfig = async () =>
-  (await api.post<{ ok: boolean; message: string }>('/model-config/test')).data
+export const listModelConfigs = async () =>
+  (await api.get<AnalysisModelConfig[]>('/model-configs')).data
+export const createModelConfig = async (payload: AnalysisModelConfigInput) =>
+  (await api.post<AnalysisModelConfig>('/model-configs', payload)).data
+export const updateModelConfig = async (
+  id: string,
+  payload: AnalysisModelConfigInput,
+) => (await api.put<AnalysisModelConfig>(`/model-configs/${id}`, payload)).data
+export const deleteModelConfig = async (id: string) => {
+  await api.delete(`/model-configs/${id}`)
+}
+export const testModelConfig = async (id: string) =>
+  (await api.post<{ ok: boolean; message: string }>(`/model-configs/${id}/test`)).data
 
 export const analysisEventUrl = (runId: string) =>
   `${window.location.origin}/api/v1/analysis-runs/${runId}/events`

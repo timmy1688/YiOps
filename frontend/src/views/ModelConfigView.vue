@@ -1,205 +1,371 @@
 <script setup lang="ts">
-import { Connection, Key, Cpu } from '@element-plus/icons-vue'
-import { ElMessage } from 'element-plus'
+import {
+  Connection,
+  Cpu,
+  Delete as DeleteIcon,
+  Edit,
+  Key,
+  Plus,
+} from '@element-plus/icons-vue'
+import { ElMessage, ElMessageBox } from 'element-plus'
 import { computed, onMounted, reactive, ref } from 'vue'
 
 import {
-  getModelConfig,
-  saveModelConfig,
+  createModelConfig,
+  deleteModelConfig,
+  listModelConfigs,
   testModelConfig,
+  updateModelConfig,
   type AnalysisModelConfig,
   type AnalysisModelConfigInput,
 } from '@/api/client'
 
 const loading = ref(false)
+const drawerVisible = ref(false)
 const saving = ref(false)
-const testing = ref(false)
-const saved = ref<AnalysisModelConfig | null>(null)
+const testingId = ref('')
+const activatingId = ref('')
+const deletingId = ref('')
+const editingId = ref('')
+const configs = ref<AnalysisModelConfig[]>([])
 const form = reactive<AnalysisModelConfigInput>({
-  name: 'DeepSeek',
+  name: '',
   provider: 'deepseek',
   base_url: 'https://api.deepseek.com',
   model_name: 'deepseek-chat',
   api_key: '',
-  enabled: true,
+  enabled: false,
 })
 
+const editingConfig = computed(
+  () => configs.value.find((item) => item.id === editingId.value) ?? null,
+)
+const activeConfig = computed(() => configs.value.find((item) => item.enabled) ?? null)
 const modeLabel = computed(() => {
-  if (!saved.value?.enabled || !saved.value.api_key_configured) return '本地规则降级'
-  if (saved.value.last_test_status === 'healthy') return '真实模型已连接'
-  return '模型已配置，等待测试'
+  if (!activeConfig.value?.api_key_configured) return '本地规则降级'
+  if (activeConfig.value.last_test_status === 'healthy') return '真实模型已连接'
+  return '渠道已启用，等待测试'
 })
 
 async function load() {
   loading.value = true
   try {
-    saved.value = await getModelConfig()
-    if (saved.value) {
-      form.name = saved.value.name
-      form.provider = saved.value.provider
-      form.base_url = saved.value.base_url
-      form.model_name = saved.value.model_name
-      form.api_key = ''
-      form.enabled = saved.value.enabled
+    const items = await listModelConfigs()
+    if (!Array.isArray(items)) {
+      throw new Error('模型渠道接口返回格式错误')
     }
+    configs.value = items
   } catch {
-    ElMessage.error('模型配置加载失败')
+    ElMessage.error('模型渠道加载失败')
   } finally {
     loading.value = false
   }
 }
 
+function openCreate() {
+  editingId.value = ''
+  Object.assign(form, {
+    name: '',
+    provider: 'deepseek',
+    base_url: 'https://api.deepseek.com',
+    model_name: 'deepseek-chat',
+    api_key: '',
+    enabled: configs.value.length === 0,
+  })
+  drawerVisible.value = true
+}
+
+function openEdit(item: AnalysisModelConfig) {
+  editingId.value = item.id
+  Object.assign(form, {
+    name: item.name,
+    provider: item.provider,
+    base_url: item.base_url,
+    model_name: item.model_name,
+    api_key: '',
+    enabled: item.enabled,
+  })
+  drawerVisible.value = true
+}
+
 async function save() {
   if (!form.name.trim() || !form.base_url.trim() || !form.model_name.trim()) {
-    ElMessage.warning('请完整填写名称、API 地址和模型名称')
+    ElMessage.warning('请完整填写渠道名称、API 地址和模型名称')
     return
   }
-  if (!saved.value?.api_key_configured && !form.api_key?.trim()) {
-    ElMessage.warning('首次接入必须填写 API Key')
+  if (!editingConfig.value?.api_key_configured && !form.api_key?.trim()) {
+    ElMessage.warning('新建渠道必须填写 API Key')
     return
+  }
+
+  const payload: AnalysisModelConfigInput = {
+    name: form.name.trim(),
+    provider: form.provider,
+    base_url: form.base_url.trim(),
+    model_name: form.model_name.trim(),
+    api_key: form.api_key?.trim() || undefined,
+    enabled: form.enabled,
   }
   saving.value = true
   try {
-    saved.value = await saveModelConfig({
-      ...form,
-      name: form.name.trim(),
-      base_url: form.base_url.trim(),
-      model_name: form.model_name.trim(),
-      api_key: form.api_key?.trim() || undefined,
-    })
-    form.api_key = ''
-    ElMessage.success('模型配置已加密保存')
+    if (editingId.value) {
+      await updateModelConfig(editingId.value, payload)
+      ElMessage.success('模型渠道已更新')
+    } else {
+      await createModelConfig(payload)
+      ElMessage.success('模型渠道已添加')
+    }
+    drawerVisible.value = false
+    await load()
   } catch {
-    ElMessage.error('保存失败，请检查填写内容')
+    ElMessage.error('保存失败，请检查渠道名称和连接参数')
   } finally {
     saving.value = false
   }
 }
 
-async function test() {
-  testing.value = true
+async function test(item: AnalysisModelConfig) {
+  testingId.value = item.id
   try {
-    const result = await testModelConfig()
+    const result = await testModelConfig(item.id)
     await load()
     result.ok ? ElMessage.success(result.message) : ElMessage.error(result.message)
   } catch {
-    ElMessage.error('连接测试失败，请先保存配置')
+    ElMessage.error('连接测试失败，请检查渠道配置')
   } finally {
-    testing.value = false
+    testingId.value = ''
   }
+}
+
+async function activate(item: AnalysisModelConfig) {
+  activatingId.value = item.id
+  try {
+    await updateModelConfig(item.id, {
+      name: item.name,
+      provider: item.provider,
+      base_url: item.base_url,
+      model_name: item.model_name,
+      enabled: true,
+    })
+    await load()
+    ElMessage.success(`已切换到“${item.name}”`)
+  } catch {
+    ElMessage.error('渠道切换失败')
+  } finally {
+    activatingId.value = ''
+  }
+}
+
+async function remove(item: AnalysisModelConfig) {
+  try {
+    await ElMessageBox.confirm(
+      `确定删除模型渠道“${item.name}”吗？${item.enabled ? '删除当前渠道后，分析将降级为本地规则。' : ''}`,
+      '删除模型渠道',
+      {
+        confirmButtonText: '确认删除',
+        cancelButtonText: '取消',
+        confirmButtonClass: 'el-button--danger',
+        type: 'warning',
+      },
+    )
+  } catch {
+    return
+  }
+
+  deletingId.value = item.id
+  try {
+    await deleteModelConfig(item.id)
+    await load()
+    ElMessage.success('模型渠道已删除')
+  } catch {
+    ElMessage.error('模型渠道删除失败')
+  } finally {
+    deletingId.value = ''
+  }
+}
+
+function applyProviderPreset(provider: AnalysisModelConfig['provider']) {
+  if (provider === 'deepseek') {
+    form.base_url = 'https://api.deepseek.com'
+    form.model_name = 'deepseek-chat'
+    return
+  }
+  form.base_url = 'https://api.openai.com/v1'
+  form.model_name = ''
 }
 
 onMounted(() => void load())
 </script>
 
 <template>
-  <section v-loading="loading">
+  <section>
     <header class="page-header">
       <div>
-        <p class="eyebrow">ANALYSIS MODEL</p>
+        <p class="eyebrow">ANALYSIS MODEL CHANNELS</p>
         <h1>分析模型</h1>
         <p class="page-subtitle">
-          Agent 使用该模型制定调查计划并基于证据生成根因报告。
+          可维护多个模型渠道，并选择一个供 Agent 执行后续分析。
         </p>
       </div>
-      <div class="model-mode-badge" :class="{ healthy: saved?.last_test_status === 'healthy' }">
-        <i></i>{{ modeLabel }}
-      </div>
+      <el-button type="primary" :icon="Plus" @click="openCreate">
+        添加模型渠道
+      </el-button>
     </header>
 
-    <div class="model-config-layout">
-      <section class="panel model-config-form">
-        <div class="section-heading">
-          <div>
-            <h2>模型连接</h2>
-            <p>当前 MVP 只启用一个分析模型，修改后对下一次分析生效</p>
+    <div class="model-summary-grid">
+      <section class="panel model-status-card">
+        <div class="model-status-icon"><Cpu /></div>
+        <span>当前分析渠道</span>
+        <strong>{{ activeConfig?.name || 'local-evidence-rules' }}</strong>
+        <p>
+          {{ activeConfig ? `${activeConfig.model_name} · ${modeLabel}` : modeLabel }}
+        </p>
+      </section>
+      <section class="panel model-security-card">
+        <Key />
+        <div>
+          <strong>OpenAI 兼容协议</strong>
+          <p>所有渠道均使用 Chat Completions 接口；API Key 加密落库且不回显。</p>
+        </div>
+      </section>
+    </div>
+
+    <section v-loading="loading" class="model-channel-list">
+      <article
+        v-for="item in configs"
+        :key="item.id"
+        class="panel model-channel-card"
+        :class="{ active: item.enabled }"
+      >
+        <div class="model-channel-main">
+          <div class="model-channel-icon"><Connection /></div>
+          <div class="model-channel-copy">
+            <div class="model-channel-title">
+              <h3>{{ item.name }}</h3>
+              <el-tag type="info">
+                {{ item.provider === 'deepseek' ? 'DeepSeek' : 'OpenAI Compatible' }}
+              </el-tag>
+              <el-tag v-if="item.enabled" type="primary">当前渠道</el-tag>
+              <el-tag
+                :type="item.last_test_status === 'healthy' ? 'success' : item.last_test_status === 'failed' ? 'danger' : 'info'"
+              >
+                {{
+                  item.last_test_status === 'healthy'
+                    ? '连接正常'
+                    : item.last_test_status === 'failed'
+                      ? '连接失败'
+                      : '未测试'
+                }}
+              </el-tag>
+            </div>
+            <strong>{{ item.model_name }}</strong>
+            <code>{{ item.base_url }}</code>
+            <small>
+              API Key：{{ item.api_key_configured ? '已配置' : '未配置' }}
+              <template v-if="item.last_tested_at">
+                · 最近测试 {{ new Date(item.last_tested_at).toLocaleString() }}
+              </template>
+            </small>
+            <p v-if="item.last_test_message">{{ item.last_test_message }}</p>
           </div>
         </div>
+        <div class="model-channel-actions">
+          <el-button
+            :loading="testingId === item.id"
+            :disabled="!item.api_key_configured"
+            @click="test(item)"
+          >
+            测试连接
+          </el-button>
+          <el-button
+            v-if="!item.enabled"
+            type="primary"
+            plain
+            :loading="activatingId === item.id"
+            @click="activate(item)"
+          >
+            设为当前
+          </el-button>
+          <el-button :icon="Edit" @click="openEdit(item)">编辑</el-button>
+          <el-button
+            plain
+            type="danger"
+            :icon="DeleteIcon"
+            :loading="deletingId === item.id"
+            @click="remove(item)"
+          >
+            删除
+          </el-button>
+        </div>
+      </article>
+      <el-empty
+        v-if="!loading && !configs.length"
+        description="还没有模型渠道；当前分析使用本地证据规则"
+      >
+        <el-button type="primary" @click="openCreate">添加第一个渠道</el-button>
+      </el-empty>
+    </section>
 
-        <el-form label-position="top">
-          <div class="form-grid">
-            <el-form-item label="配置名称">
-              <el-input v-model="form.name" placeholder="例如：生产 DeepSeek" />
-            </el-form-item>
-            <el-form-item label="接口类型">
-              <el-select v-model="form.provider">
-                <el-option label="DeepSeek" value="deepseek" />
-                <el-option label="OpenAI 兼容接口" value="openai_compatible" />
-              </el-select>
-            </el-form-item>
-          </div>
-          <el-form-item label="API 地址">
-            <el-input v-model="form.base_url" placeholder="https://api.deepseek.com" />
-          </el-form-item>
-          <el-form-item label="模型名称">
-            <el-input
-              v-model="form.model_name"
-              placeholder="填写服务商实际提供的模型 ID"
-            />
-          </el-form-item>
-          <el-form-item label="API Key">
-            <el-input
-              v-model="form.api_key"
-              type="password"
-              show-password
-              :placeholder="
-                saved?.api_key_configured
-                  ? '已配置；留空表示不修改'
-                  : '请输入 API Key'
-              "
-            />
-            <span class="field-help">
-              Key 使用本机密钥加密保存，不会通过查询接口回显，也不会传给数据源。
-            </span>
-          </el-form-item>
-          <el-form-item class="switch-form-item">
-            <div>
-              <strong>启用真实模型</strong>
-              <span>关闭后分析自动降级为本地证据规则</span>
-            </div>
-            <el-switch v-model="form.enabled" />
-          </el-form-item>
-          <div class="model-form-actions">
-            <el-button
-              :icon="Connection"
-              :loading="testing"
-              :disabled="!saved?.api_key_configured"
-              @click="test"
-            >
-              测试连接
-            </el-button>
-            <el-button type="primary" :loading="saving" @click="save">
-              保存配置
-            </el-button>
-          </div>
-        </el-form>
-      </section>
-
-      <aside class="model-config-side">
-        <section class="panel model-status-card">
-          <div class="model-status-icon"><Cpu /></div>
-          <span>当前分析引擎</span>
-          <strong>{{ saved?.model_name || 'local-evidence-rules' }}</strong>
-          <p>{{ modeLabel }}</p>
-        </section>
-
-        <section class="panel model-security-card">
-          <Key />
+    <el-drawer
+      v-model="drawerVisible"
+      :title="editingId ? '编辑模型渠道' : '添加模型渠道'"
+      size="500px"
+    >
+      <p class="drawer-intro">
+        填写服务商提供的 OpenAI Compatible Base URL、模型 ID 和 API Key。
+      </p>
+      <el-form label-position="top">
+        <el-form-item label="渠道名称">
+          <el-input v-model="form.name" placeholder="例如：生产 DeepSeek" />
+        </el-form-item>
+        <el-form-item label="渠道类型">
+          <el-select
+            v-model="form.provider"
+            @change="applyProviderPreset"
+          >
+            <el-option label="DeepSeek" value="deepseek" />
+            <el-option label="其他 OpenAI Compatible" value="openai_compatible" />
+          </el-select>
+          <span class="field-help">
+            DeepSeek 渠道会自动填入官方默认地址；两种类型均使用 OpenAI 协议。
+          </span>
+        </el-form-item>
+        <el-form-item label="API 地址">
+          <el-input
+            v-model="form.base_url"
+            placeholder="例如：https://api.openai.com/v1"
+          />
+        </el-form-item>
+        <el-form-item label="模型名称">
+          <el-input v-model="form.model_name" placeholder="服务商提供的模型 ID" />
+        </el-form-item>
+        <el-form-item label="API Key">
+          <el-input
+            v-model="form.api_key"
+            type="password"
+            show-password
+            :placeholder="
+              editingConfig?.api_key_configured
+                ? '已配置；留空表示不修改'
+                : '请输入 API Key'
+            "
+          />
+          <span class="field-help">
+            Key 使用本机密钥加密保存，不会通过查询接口回显。
+          </span>
+        </el-form-item>
+        <el-form-item class="switch-form-item">
           <div>
-            <strong>密钥安全</strong>
-            <p>API Key 加密落库，前端只能看到是否已配置。</p>
+            <strong>设为当前分析渠道</strong>
+            <span>开启后会自动停用其他渠道，下一次分析起生效</span>
           </div>
-        </section>
-
-        <section v-if="saved?.last_tested_at" class="panel model-test-card">
-          <span>最近连接测试</span>
-          <strong :class="saved.last_test_status || ''">
-            {{ saved.last_test_status === 'healthy' ? '连接成功' : '连接失败' }}
-          </strong>
-          <p>{{ saved.last_test_message }}</p>
-          <time>{{ new Date(saved.last_tested_at).toLocaleString() }}</time>
-        </section>
-      </aside>
-    </div>
+          <el-switch v-model="form.enabled" />
+        </el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button @click="drawerVisible = false">取消</el-button>
+        <el-button type="primary" :loading="saving" @click="save">保存</el-button>
+      </template>
+    </el-drawer>
   </section>
 </template>

@@ -38,9 +38,7 @@ class AlertIntegration(TimestampModel):
     webhook_token = fields.CharField(max_length=64, unique=True)
     default_cluster = fields.CharField(max_length=255, null=True)
     default_namespace = fields.CharField(max_length=255, null=True)
-    # Kept for database compatibility. New alert sources always require a
-    # human decision before an analysis run is created.
-    auto_analyze = fields.BooleanField(default=False)
+    auto_analyze = fields.BooleanField(default=True)
     enabled = fields.BooleanField(default=True)
     received_count = fields.IntField(default=0)
     last_received_at = fields.DatetimeField(null=True)

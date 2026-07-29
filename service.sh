@@ -43,6 +43,27 @@ start() {
     fi
 }
 
+run_foreground() {
+    if running; then
+        echo "YiOps already running, PID $(cat "$PID_FILE")"
+        return
+    fi
+    if [[ ! -x "$PYTHON" ]]; then
+        echo "Missing backend/.venv; install backend dependencies first."
+        exit 1
+    fi
+    if [[ ! -f "$ROOT/frontend/dist/index.html" ]]; then
+        echo "Missing frontend/dist; run: cd frontend && npm run build"
+        exit 1
+    fi
+
+    mkdir -p "$ROOT/.runtime" "$ROOT/logs"
+    cd "$ROOT/backend" || exit 1
+    echo "$$" > "$PID_FILE"
+    exec "$PYTHON" -m uvicorn app.main:app \
+        --host 0.0.0.0 --port "$PORT"
+}
+
 stop() {
     if ! running; then
         rm -f "$PID_FILE"
@@ -68,9 +89,10 @@ status() {
 
 case "${1:-}" in
     start) start ;;
+    run) run_foreground ;;
     stop) stop ;;
     restart) stop; start ;;
     status) status ;;
     logs) tail -f "$LOG_FILE" ;;
-    *) echo "Usage: $0 {start|stop|restart|status|logs}"; exit 1 ;;
+    *) echo "Usage: $0 {start|run|stop|restart|status|logs}"; exit 1 ;;
 esac

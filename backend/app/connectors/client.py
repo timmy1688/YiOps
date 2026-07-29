@@ -53,6 +53,7 @@ class DatasourceClient:
                         service,
                         start,
                         end,
+                        namespace,
                     )
                 elif template.source == "kubernetes":
                     result = await self._query_kubernetes(
@@ -122,6 +123,8 @@ class DatasourceClient:
         cluster: str | None = None,
     ) -> DatasourceConfig | None:
         items = await DatasourceConfig.filter(type=source, enabled=True).order_by("created_at")
+        if not items:
+            return None
         if source == "kubernetes" and cluster:
             for item in items:
                 if str(item.settings.get("cluster_id", "")) == cluster:
@@ -176,8 +179,18 @@ class DatasourceClient:
         service: str,
         start: datetime,
         end: datetime,
+        namespace: str | None,
     ) -> ToolResult:
-        query = template.query.replace("{service}", service.replace('"', ""))
+        escaped_namespace = (
+            namespace.replace("\\", "\\\\").replace('"', '\\"') if namespace else None
+        )
+        namespace_selector = (
+            f'namespace="{escaped_namespace}"' if escaped_namespace else 'namespace=~".+"'
+        )
+        query = (
+            template.query.replace("{service}", service.replace('"', ""))
+            .replace('namespace=~"{namespace}"', namespace_selector)
+        )
         params = {
             "query": query,
             "start": int(start.replace(tzinfo=UTC).timestamp() * 1_000_000_000),

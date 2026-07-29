@@ -1,6 +1,7 @@
 import asyncio
+import math
 from dataclasses import asdict
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from typing import Any, TypedDict
 
 from langgraph.graph import END, START, StateGraph
@@ -28,6 +29,7 @@ class AgentState(TypedDict, total=False):
     incident: dict[str, Any]
     plan: dict[str, Any]
     tool_results: list[dict[str, Any]]
+    collection_summary: list[dict[str, Any]]
     evidence: list[dict[str, Any]]
     report: dict[str, Any]
 
@@ -36,7 +38,8 @@ STEP_PROGRESS = {
     "normalize": 0.1,
     "plan": 0.25,
     "collect": 0.5,
-    "compress": 0.68,
+    "compress": 0.62,
+    "refine": 0.76,
     "analyze": 0.85,
     "validate": 0.94,
     "save": 1.0,
@@ -63,6 +66,7 @@ class AnalysisAgent:
         builder.add_node("plan", self._plan)
         builder.add_node("collect", self._collect)
         builder.add_node("compress", self._compress)
+        builder.add_node("refine", self._refine)
         builder.add_node("analyze", self._analyze)
         builder.add_node("validate", self._validate)
         builder.add_node("save", self._save)
@@ -70,7 +74,8 @@ class AnalysisAgent:
         builder.add_edge("normalize", "plan")
         builder.add_edge("plan", "collect")
         builder.add_edge("collect", "compress")
-        builder.add_edge("compress", "analyze")
+        builder.add_edge("compress", "refine")
+        builder.add_edge("refine", "analyze")
         builder.add_edge("analyze", "validate")
         builder.add_edge("validate", "save")
         builder.add_edge("save", END)
@@ -87,13 +92,27 @@ class AnalysisAgent:
             "incident": {
                 "id": incident.id,
                 "title": incident.title,
-                "alert_name": incident.title,
+                "alert_name": (
+                    latest_alert.alert_name if latest_alert is not None else incident.title
+                ),
                 "service": incident.service,
                 "cluster": incident.cluster,
                 "namespace": incident.namespace,
+                "instance": latest_alert.instance if latest_alert is not None else None,
                 "severity": incident.severity,
+                "source": latest_alert.source if latest_alert is not None else None,
+                "labels": dict(latest_alert.labels) if latest_alert is not None else {},
+                "annotations": (
+                    dict(latest_alert.annotations) if latest_alert is not None else {}
+                ),
+                "alert_count": incident.alert_count,
                 "is_test": self._is_test_alert(latest_alert),
                 "started_at": incident.started_at.isoformat(),
+                "ended_at": (
+                    latest_alert.ended_at.isoformat()
+                    if latest_alert is not None and latest_alert.ended_at
+                    else None
+                ),
             },
         }
         await self.graph.ainvoke(initial_state)
@@ -171,11 +190,22 @@ class AnalysisAgent:
     async def _collect(self, state: AgentState) -> AgentState:
         run_id = state["run_id"]
         await self._mark(run_id, "collect")
-        incident = state["incident"]
-        started_at = _parse_datetime(str(incident["started_at"]))
-        start = started_at - timedelta(minutes=60)
-        end = started_at + timedelta(minutes=30)
-        templates = templates_for_packs(list(state["plan"]["query_packs"]))
+        results = await self._collect_query_packs(
+            run_id,
+            state["incident"],
+            list(state["plan"]["query_packs"]),
+        )
+        await self._complete_step(run_id, "collect")
+        return {"tool_results": results}
+
+    async def _collect_query_packs(
+        self,
+        run_id: str,
+        incident: dict[str, Any],
+        query_packs: list[str],
+    ) -> list[dict[str, Any]]:
+        start, end = _investigation_window(incident)
+        templates = templates_for_packs(query_packs)
         results = await asyncio.gather(
             *[
                 self._execute_template(
@@ -190,8 +220,7 @@ class AnalysisAgent:
                 for template in templates
             ]
         )
-        await self._complete_step(run_id, "collect")
-        return {"tool_results": results}
+        return list(results)
 
     async def _execute_template(
         self,
@@ -265,60 +294,142 @@ class AnalysisAgent:
         )
         return {"tool_execution_id": execution.id, **asdict(result)}
 
+    async def _store_evidence(
+        self,
+        run_id: str,
+        incident: dict[str, Any],
+        tool_results: list[dict[str, Any]],
+    ) -> None:
+        represented_tool_ids = {
+            item
+            for item in await EvidenceItem.filter(analysis_run_id=run_id).values_list(
+                "tool_execution_id",
+                flat=True,
+            )
+            if item
+        }
+        for raw in tool_results:
+            tool_execution_id = str(raw["tool_execution_id"])
+            if tool_execution_id in represented_tool_ids:
+                continue
+            template = TEMPLATES_BY_ID[str(raw["template_id"])]
+            from app.agents.domain import ToolResult
+
+            result = ToolResult(
+                source=raw["source"],
+                query_pack=str(raw["query_pack"]),
+                template_id=str(raw["template_id"]),
+                status=str(raw["status"]),
+                result_count=int(raw.get("result_count", 0)),
+                data=dict(raw.get("data", {})),
+                duration_ms=int(raw.get("duration_ms", 0)),
+                error_code=raw.get("error_code"),
+            )
+            record = build_evidence(
+                result,
+                template,
+                service=str(incident["service"]),
+                tool_execution_id=tool_execution_id,
+            )
+            if record is None:
+                continue
+            if await EvidenceItem.get_or_none(
+                analysis_run_id=run_id,
+                content_hash=record.content_hash,
+            ):
+                continue
+            item = await EvidenceItem.create(
+                id=record.id,
+                analysis_run_id=run_id,
+                tool_execution_id=record.tool_execution_id,
+                type=record.type,
+                source=record.source,
+                title=record.title,
+                summary=record.summary,
+                observed_at=record.observed_at,
+                subject=record.subject,
+                values=record.values,
+                quality=record.quality,
+                content_hash=record.content_hash,
+            )
+            represented_tool_ids.add(tool_execution_id)
+            await self.events.publish(
+                run_id,
+                "evidence.created",
+                {"evidence_id": item.id, "type": item.type},
+            )
+
+    async def _load_evidence(
+        self,
+        run_id: str,
+        incident: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        evidence = [
+            _evidence_to_dict(item)
+            for item in await EvidenceItem.filter(analysis_run_id=run_id).all()
+        ]
+        evidence.sort(
+            key=lambda item: _evidence_relevance(item, str(incident["started_at"])),
+            reverse=True,
+        )
+        return evidence[: self.settings.max_evidence_items]
+
     async def _compress(self, state: AgentState) -> AgentState:
         run_id = state["run_id"]
         await self._mark(run_id, "compress")
-        existing = await EvidenceItem.filter(analysis_run_id=run_id).all()
-        if existing:
-            evidence = [_evidence_to_dict(item) for item in existing]
-        else:
-            evidence = []
-            for raw in state.get("tool_results", []):
-                template = TEMPLATES_BY_ID[str(raw["template_id"])]
-                from app.agents.domain import ToolResult
-
-                result = ToolResult(
-                    source=raw["source"],
-                    query_pack=str(raw["query_pack"]),
-                    template_id=str(raw["template_id"]),
-                    status=str(raw["status"]),
-                    result_count=int(raw.get("result_count", 0)),
-                    data=dict(raw.get("data", {})),
-                    duration_ms=int(raw.get("duration_ms", 0)),
-                    error_code=raw.get("error_code"),
-                )
-                record = build_evidence(
-                    result,
-                    template,
-                    service=str(state["incident"]["service"]),
-                    tool_execution_id=str(raw["tool_execution_id"]),
-                )
-                if record is None:
-                    continue
-                item = await EvidenceItem.create(
-                    id=record.id,
-                    analysis_run_id=run_id,
-                    tool_execution_id=record.tool_execution_id,
-                    type=record.type,
-                    source=record.source,
-                    title=record.title,
-                    summary=record.summary,
-                    observed_at=record.observed_at,
-                    subject=record.subject,
-                    values=record.values,
-                    quality=record.quality,
-                    content_hash=record.content_hash,
-                )
-                evidence.append(_evidence_to_dict(item))
-                await self.events.publish(
-                    run_id,
-                    "evidence.created",
-                    {"evidence_id": item.id, "type": item.type},
-                )
-        evidence.sort(key=lambda item: float(item["quality"]), reverse=True)
-        evidence = evidence[: self.settings.max_evidence_items]
+        await self._store_evidence(
+            run_id,
+            state["incident"],
+            state.get("tool_results", []),
+        )
+        evidence = await self._load_evidence(run_id, state["incident"])
+        collection_summary = _collection_summary(state.get("tool_results", []))
         await self._complete_step(run_id, "compress")
-        return {"evidence": evidence}
+        return {"evidence": evidence, "collection_summary": collection_summary}
+
+    async def _refine(self, state: AgentState) -> AgentState:
+        run_id = state["run_id"]
+        await self._mark(run_id, "refine")
+        used_packs = list(state["plan"]["query_packs"])
+        result = await self.llm.refine(
+            state["incident"],
+            state.get("evidence", []),
+            used_packs,
+            state.get("collection_summary", []),
+        )
+        additional_packs = [
+            pack
+            for pack in dict.fromkeys(result.value.query_packs)
+            if pack not in used_packs
+        ]
+        run = await AnalysisRun.get(id=run_id)
+        run.input_tokens += result.input_tokens
+        run.output_tokens += result.output_tokens
+        plan = dict(state["plan"])
+        evidence = state.get("evidence", [])
+        collection_summary = state.get("collection_summary", [])
+        if additional_packs:
+            plan = {"query_packs": used_packs + additional_packs}
+            run.investigation_plan = plan
+            extra_results = await self._collect_query_packs(
+                run_id,
+                state["incident"],
+                additional_packs,
+            )
+            await self._store_evidence(run_id, state["incident"], extra_results)
+            evidence = await self._load_evidence(run_id, state["incident"])
+            collection_summary = collection_summary + _collection_summary(extra_results)
+        await run.save(
+            update_fields=["investigation_plan", "input_tokens", "output_tokens"]
+            if additional_packs
+            else ["input_tokens", "output_tokens"]
+        )
+        await self._complete_step(run_id, "refine")
+        return {
+            "plan": plan,
+            "evidence": evidence,
+            "collection_summary": collection_summary,
+        }
 
     async def _analyze(self, state: AgentState) -> AgentState:
         run_id = state["run_id"]
@@ -327,7 +438,11 @@ class AnalysisAgent:
         if existing is not None:
             report = _report_to_output(existing).model_dump(mode="json")
         else:
-            result = await self.llm.analyze(state["incident"], state.get("evidence", []))
+            result = await self.llm.analyze(
+                state["incident"],
+                state.get("evidence", []),
+                collection_summary=state.get("collection_summary", []),
+            )
             report = result.value.model_dump(mode="json")
             run = await AnalysisRun.get(id=run_id)
             run.input_tokens += result.input_tokens
@@ -345,6 +460,7 @@ class AnalysisAgent:
             result = await self.llm.analyze(
                 state["incident"],
                 state.get("evidence", []),
+                collection_summary=state.get("collection_summary", []),
                 validation_error=error,
             )
             report = result.value
@@ -355,6 +471,7 @@ class AnalysisAgent:
             await run.save(update_fields=["input_tokens", "output_tokens"])
         if error:
             raise ValueError(f"REPORT_VALIDATION_FAILED: {error}")
+        report = _calibrate_confidence(report, state.get("evidence", []))
         await self._complete_step(run_id, "validate")
         return {"report": report.model_dump(mode="json")}
 
@@ -432,13 +549,102 @@ def _report_validation_error(
     return None
 
 
-def _parse_datetime(value: str):
-    from datetime import datetime
+def _collection_summary(tool_results: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        {
+            "template_id": str(item.get("template_id", "")),
+            "source": str(item.get("source", "")),
+            "status": str(item.get("status", "")),
+            "result_count": int(item.get("result_count", 0)),
+            "error_code": item.get("error_code"),
+        }
+        for item in tool_results
+    ]
 
-    return datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+def _calibrate_confidence(
+    report: RootCauseOutput,
+    evidence: list[dict[str, Any]],
+) -> RootCauseOutput:
+    if not evidence:
+        ceiling = 0.2
+    else:
+        sources = {str(item.get("source", "")) for item in evidence if item.get("source")}
+        ceiling = 0.65
+        if len(evidence) >= 2:
+            ceiling += 0.1
+        if len(evidence) >= 5:
+            ceiling += 0.05
+        if len(sources) >= 2:
+            ceiling += 0.08
+        if len(sources) >= 3:
+            ceiling += 0.05
+        ceiling = min(ceiling, 0.93)
+
+    for hypothesis in report.hypotheses:
+        hypothesis_ceiling = ceiling
+        if len(hypothesis.supporting_evidence_ids) == 1:
+            hypothesis_ceiling = min(hypothesis_ceiling, 0.72)
+        hypothesis.confidence = min(hypothesis.confidence, hypothesis_ceiling)
+    if report.hypotheses:
+        report.confidence = min(
+            report.confidence,
+            ceiling,
+            max(item.confidence for item in report.hypotheses),
+        )
+    else:
+        report.confidence = min(report.confidence, 0.2)
+
+    source_count = len(
+        {str(item.get("source", "")) for item in evidence if item.get("source")}
+    )
+    boundary = "缺少跨数据源交叉验证"
+    if report.hypotheses and source_count < 2 and boundary not in report.missing_evidence:
+        report.missing_evidence.append(boundary)
+    return report
 
 
-def _utcnow():
-    from datetime import UTC, datetime
+def _investigation_window(incident: dict[str, Any]) -> tuple[datetime, datetime]:
+    started_at = _parse_datetime(str(incident["started_at"]))
+    ended_at = (
+        _parse_datetime(str(incident["ended_at"]))
+        if incident.get("ended_at")
+        else _utcnow()
+    )
+    start = started_at - timedelta(minutes=60)
+    minimum_end = started_at + timedelta(minutes=30)
+    maximum_end = started_at + timedelta(hours=6)
+    end = max(minimum_end, min(ended_at, maximum_end))
+    return start, end
 
+
+def _evidence_relevance(item: dict[str, Any], incident_started_at: str) -> float:
+    score = float(item["quality"])
+    values = item.get("values", {})
+    if isinstance(values, dict):
+        change = values.get("change_percent")
+        if isinstance(change, int | float):
+            score += min(abs(float(change)) / 100, 1) * 0.2
+        count = values.get("count")
+        if isinstance(count, int | float) and count > 0:
+            score += min(math.log1p(float(count)) / 50, 0.1)
+    if item.get("observed_at"):
+        observed_at = _parse_datetime(str(item["observed_at"]))
+        started_at = _parse_datetime(incident_started_at)
+        distance = abs((observed_at - started_at).total_seconds())
+        if distance <= 15 * 60:
+            score += 0.2
+        elif distance <= 60 * 60:
+            score += 0.12
+        elif distance <= 6 * 60 * 60:
+            score += 0.05
+    return score
+
+
+def _parse_datetime(value: str) -> datetime:
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    return parsed.replace(tzinfo=parsed.tzinfo or UTC)
+
+
+def _utcnow() -> datetime:
     return datetime.now(UTC)

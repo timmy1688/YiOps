@@ -60,6 +60,8 @@ async def create_or_aggregate_alert(
     source: str,
 ) -> Incident:
     started_at = _ensure_utc(alert["started_at"])
+    alert_status = str(alert.get("status", "firing")).lower()
+    ended_at = alert.get("ended_at")
     aggregation_key = _aggregation_key(alert, started_at)
     fingerprint = str(alert.get("external_id") or _fingerprint(alert))
     duplicate = await AlertEvent.get_or_none(
@@ -67,10 +69,20 @@ async def create_or_aggregate_alert(
         started_at=started_at,
     )
     if duplicate is not None:
-        return await Incident.get(id=duplicate.incident_id)
+        incident = await Incident.get(id=duplicate.incident_id)
+        if _is_resolved(alert_status):
+            duplicate.status = "resolved"
+            duplicate.ended_at = ended_at or duplicate.ended_at or datetime.now(UTC)
+            await duplicate.save(update_fields=["status", "ended_at"])
+            await _refresh_incident_resolution(
+                incident,
+                fallback_ended_at=duplicate.ended_at,
+            )
+        return incident
 
     incident = await Incident.get_or_none(aggregation_key=aggregation_key, status="open")
     if incident is None:
+        resolved = _is_resolved(alert_status)
         incident = await Incident.create(
             id=new_id("inc"),
             aggregation_key=aggregation_key,
@@ -79,8 +91,9 @@ async def create_or_aggregate_alert(
             cluster=alert.get("cluster"),
             namespace=alert.get("namespace"),
             severity=str(alert.get("severity", "warning")),
-            status="open",
+            status="resolved" if resolved else "open",
             started_at=started_at,
+            ended_at=(ended_at or datetime.now(UTC)) if resolved else None,
             alert_count=1,
         )
     else:
@@ -100,14 +113,48 @@ async def create_or_aggregate_alert(
         namespace=alert.get("namespace"),
         instance=alert.get("instance"),
         severity=str(alert.get("severity", "warning")),
-        status=str(alert.get("status", "firing")),
+        status=alert_status,
         started_at=started_at,
-        ended_at=alert.get("ended_at"),
+        ended_at=ended_at,
         labels=alert.get("labels", {}),
         annotations=alert.get("annotations", {}),
         incident_id=incident.id,
     )
+    if _is_resolved(alert_status):
+        await _refresh_incident_resolution(
+            incident,
+            fallback_ended_at=ended_at,
+        )
     return incident
+
+
+async def _refresh_incident_resolution(
+    incident: Incident,
+    *,
+    fallback_ended_at: datetime | None,
+) -> None:
+    has_active_alerts = (
+        await AlertEvent.filter(incident_id=incident.id).exclude(status="resolved").exists()
+    )
+    if has_active_alerts:
+        return
+
+    latest_resolved = (
+        await AlertEvent.filter(incident_id=incident.id, status="resolved")
+        .order_by("-ended_at")
+        .first()
+    )
+    incident.status = "resolved"
+    incident.ended_at = (
+        (latest_resolved.ended_at if latest_resolved is not None else None)
+        or fallback_ended_at
+        or datetime.now(UTC)
+    )
+    await incident.save(update_fields=["status", "ended_at", "updated_at"])
+
+
+def _is_resolved(status: str) -> bool:
+    return status.lower() in {"resolved", "closed"}
 
 
 def _aggregation_key(alert: dict[str, Any], started_at: datetime) -> str:

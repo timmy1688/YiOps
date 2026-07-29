@@ -76,6 +76,11 @@ spec:
     - from:
         - ipBlock:
             cidr: 192.0.2.10/32
+        # Keep cluster-local Alloy writes allowed when this overlay replaces
+        # the NetworkPolicy created by loki-demo.yaml.
+        - podSelector:
+            matchLabels:
+              app: alloy
       ports:
         - protocol: TCP
           port: 3100

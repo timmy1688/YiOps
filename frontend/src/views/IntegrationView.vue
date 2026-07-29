@@ -22,7 +22,7 @@ const form = reactive<AlertIntegrationInput>({
   type: 'alertmanager',
   default_cluster: '',
   default_namespace: '',
-  auto_analyze: false,
+  auto_analyze: true,
   enabled: true,
 })
 
@@ -106,6 +106,19 @@ async function changeEnabled(item: AlertIntegration) {
   } catch {
     item.enabled = !item.enabled
     ElMessage.error('状态更新失败')
+  }
+}
+
+async function changeAutoAnalyze(item: AlertIntegration) {
+  try {
+    const updated = await updateIntegration(item.id, {
+      auto_analyze: item.auto_analyze,
+    })
+    Object.assign(item, updated)
+    ElMessage.success(item.auto_analyze ? '自动分析已开启' : '已切换为人工启动分析')
+  } catch {
+    item.auto_analyze = !item.auto_analyze
+    ElMessage.error('自动分析设置更新失败')
   }
 }
 
@@ -235,8 +248,16 @@ async function remove(item: AlertIntegration) {
         </div>
 
         <div class="integration-card-foot">
-          <label class="manual-analysis-mode">
-            告警仅接收并聚合，由值班人员确认后启动 Agent 分析
+          <label>
+            <el-switch
+              v-model="item.auto_analyze"
+              @change="changeAutoAnalyze(item)"
+            />
+            {{
+              item.auto_analyze
+                ? '告警到达后自动启动 Agent 分析'
+                : '由值班人员确认后启动 Agent 分析'
+            }}
           </label>
           <div class="integration-actions">
             <el-button
@@ -281,12 +302,12 @@ async function remove(item: AlertIntegration) {
             />
           </el-form-item>
         </div>
-        <el-form-item class="switch-form-item manual-review-setting">
+        <el-form-item class="switch-form-item">
           <div>
-            <strong>人工确认分析</strong>
-            <span>告警到达后只入库，不会自动消耗数据源查询和模型资源</span>
+            <strong>自动分析</strong>
+            <span>真实 firing 告警到达后立即采集证据并调用当前模型渠道</span>
           </div>
-          <el-tag type="warning" effect="plain">固定开启</el-tag>
+          <el-switch v-model="form.auto_analyze" />
         </el-form-item>
         <el-form-item class="switch-form-item">
           <div>

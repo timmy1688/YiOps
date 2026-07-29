@@ -46,7 +46,7 @@ class AlertIntegrationCreate(APIModel):
     type: Literal["alertmanager"] = "alertmanager"
     default_cluster: str = Field(min_length=1, max_length=255)
     default_namespace: str | None = Field(default=None, max_length=255)
-    auto_analyze: bool = False
+    auto_analyze: bool = True
     enabled: bool = True
 
 
@@ -73,8 +73,10 @@ class AlertIntegrationRead(APIModel):
 
 
 class AnalysisModelConfigUpsert(APIModel):
-    name: str = Field(default="DeepSeek", min_length=1, max_length=120)
-    provider: Literal["deepseek", "openai_compatible"] = "deepseek"
+    name: str = Field(min_length=1, max_length=120)
+    # "deepseek" is accepted for compatibility with clients from the
+    # single-channel version. Both values use the same OpenAI protocol.
+    provider: Literal["openai_compatible", "deepseek"] = "openai_compatible"
     base_url: HttpUrl
     model_name: str = Field(min_length=1, max_length=120)
     api_key: str | None = Field(default=None, min_length=1)
@@ -204,15 +206,20 @@ class FeedbackRead(FeedbackCreate):
     created_at: datetime
 
 
+QueryPackName = Literal[
+    "service_health",
+    "runtime_resource",
+    "instance_health",
+    "dependency_health",
+    "database_symptom",
+    "application_errors",
+    "kubernetes_cluster",
+]
+
+
 class QueryPackPlan(APIModel):
-    query_packs: list[
-        Literal[
-            "service_health",
-            "runtime_resource",
-            "instance_health",
-            "dependency_health",
-            "database_symptom",
-            "application_errors",
-            "kubernetes_cluster",
-        ]
-    ] = Field(min_length=1, max_length=7)
+    query_packs: list[QueryPackName] = Field(min_length=1, max_length=7)
+
+
+class InvestigationRefinement(APIModel):
+    query_packs: list[QueryPackName] = Field(default_factory=list, max_length=7)

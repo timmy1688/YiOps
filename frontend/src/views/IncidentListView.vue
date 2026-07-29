@@ -1,19 +1,12 @@
 <script setup lang="ts">
-import { Plus, Refresh, Search } from '@element-plus/icons-vue'
+import { Refresh, Search } from '@element-plus/icons-vue'
 import { ElMessage } from 'element-plus'
-import { computed, onMounted, onUnmounted, reactive, ref } from 'vue'
+import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 
-import {
-  createIncident,
-  listIncidents,
-  type Incident,
-  type ManualIncident,
-} from '@/api/client'
+import { listIncidents, type Incident } from '@/api/client'
 
 const router = useRouter()
-const dialogVisible = ref(false)
-const submitting = ref(false)
 const loading = ref(false)
 const incidents = ref<Incident[]>([])
 const search = ref('')
@@ -42,15 +35,6 @@ const filteredIncidents = computed(() => {
     return matchesKeyword && matchesStatus
   })
 })
-const form = reactive<ManualIncident>({
-  alert_name: 'KubernetesWorkloadHealth',
-  service: 'kubernetes-cluster',
-  cluster: 'k8s-lab',
-  namespace: 'all',
-  severity: 'critical',
-  started_at: new Date().toISOString(),
-})
-
 let refreshTimer: number | undefined
 
 async function loadIncidents() {
@@ -73,19 +57,6 @@ onUnmounted(() => {
   if (refreshTimer !== undefined) window.clearInterval(refreshTimer)
 })
 
-async function submitIncident() {
-  submitting.value = true
-  try {
-    const incident = await createIncident(form)
-    dialogVisible.value = false
-    await loadIncidents()
-    ElMessage.success('Incident 已创建')
-    await router.push(`/incidents/${incident.id}`)
-  } finally {
-    submitting.value = false
-  }
-}
-
 function openIncident(row: Incident) {
   void router.push(`/incidents/${row.id}`)
 }
@@ -102,7 +73,7 @@ function runStatusLabel(status?: string) {
     insufficient_evidence: '证据不足',
     failed_final: '失败',
   }
-  return status ? labels[status] ?? status : '待人工判断'
+  return status ? labels[status] ?? status : '等待分析'
 }
 </script>
 
@@ -112,13 +83,10 @@ function runStatusLabel(status?: string) {
       <div>
         <p class="eyebrow">INCIDENT OPERATIONS</p>
         <h1>事件中心</h1>
-        <p class="page-subtitle">统一跟踪告警调查、证据采集与根因结论。</p>
+        <p class="page-subtitle">自动跟踪真实告警、证据采集、根因结论与恢复状态。</p>
       </div>
       <div class="header-actions">
         <el-button :icon="Refresh" circle @click="loadIncidents" />
-        <el-button type="primary" :icon="Plus" @click="dialogVisible = true">
-          新建 Incident
-        </el-button>
       </div>
     </header>
 
@@ -129,9 +97,9 @@ function runStatusLabel(status?: string) {
         <small>已接入的 Incident</small>
       </div>
       <div class="metric-card pending">
-        <div class="metric-label"><span class="metric-icon amber"></span>待人工判断</div>
+        <div class="metric-label"><span class="metric-icon amber"></span>等待分析</div>
         <strong>{{ pendingCount }}</strong>
-        <small>确认后再启动分析</small>
+        <small>尚未创建分析任务</small>
       </div>
       <div class="metric-card active">
         <div class="metric-label"><span class="metric-icon amber"></span>分析中</div>
@@ -160,7 +128,7 @@ function runStatusLabel(status?: string) {
           />
           <el-select v-model="statusFilter">
             <el-option label="全部状态" value="all" />
-            <el-option label="待人工判断" value="unprocessed" />
+            <el-option label="等待分析" value="unprocessed" />
             <el-option label="分析中" value="running" />
             <el-option label="已完成" value="completed" />
             <el-option label="证据不足" value="insufficient_evidence" />
@@ -207,38 +175,5 @@ function runStatusLabel(status?: string) {
         </el-table-column>
       </el-table>
     </div>
-
-    <el-drawer v-model="dialogVisible" title="新建调查事件" size="480px">
-      <p class="drawer-intro">录入告警上下文后，Agent 将按固定只读流程采集证据。</p>
-      <el-form label-position="top">
-        <div class="form-grid">
-          <el-form-item label="告警名称">
-            <el-input v-model="form.alert_name" />
-          </el-form-item>
-          <el-form-item label="服务">
-            <el-input v-model="form.service" />
-          </el-form-item>
-          <el-form-item label="集群">
-            <el-input v-model="form.cluster" />
-          </el-form-item>
-          <el-form-item label="Namespace">
-            <el-input v-model="form.namespace" />
-          </el-form-item>
-          <el-form-item label="严重级别">
-            <el-select v-model="form.severity">
-              <el-option label="Critical" value="critical" />
-              <el-option label="Warning" value="warning" />
-              <el-option label="Info" value="info" />
-            </el-select>
-          </el-form-item>
-        </div>
-      </el-form>
-      <template #footer>
-        <el-button @click="dialogVisible = false">取消</el-button>
-        <el-button type="primary" :loading="submitting" @click="submitIncident">
-          创建并查看
-        </el-button>
-      </template>
-    </el-drawer>
   </section>
 </template>

@@ -109,7 +109,7 @@ QUERY_TEMPLATES: tuple[QueryTemplate, ...] = (
         id="k8s_error_logs",
         query_pack="kubernetes_cluster",
         source="loki",
-        query='{namespace=~".+"} |~ "(?i)(error|exception|failed|fatal)"',
+        query='{namespace=~"{namespace}"} |~ "(?i)(error|exception|failed|fatal)"',
         kind="log",
         title="Kubernetes error log patterns",
     ),
@@ -203,7 +203,10 @@ QUERY_TEMPLATES: tuple[QueryTemplate, ...] = (
         id="application_error_logs",
         query_pack="application_errors",
         source="loki",
-        query='{service="{service}"} |~ "(?i)(error|exception|fatal)"',
+        query=(
+            '{service="{service}", namespace=~"{namespace}"} '
+            '|~ "(?i)(error|exception|fatal)"'
+        ),
         kind="log",
         title="Application error logs",
     ),
