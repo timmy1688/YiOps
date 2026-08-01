@@ -8,10 +8,47 @@ class APIModel(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
 
+class AuthStatusRead(APIModel):
+    enabled: bool
+    authenticated: bool
+
+
+class LoginRequest(APIModel):
+    username: str = Field(min_length=1, max_length=120)
+    password: str = Field(min_length=1, max_length=500)
+
+
+class PasswordChangeRequest(APIModel):
+    current_password: str = Field(min_length=1, max_length=500)
+    new_password: str = Field(min_length=12, max_length=500)
+
+
+class CurrentUserRead(APIModel):
+    id: str
+    username: str
+    display_name: str
+    role: str
+    tenant_id: str
+    tenant_name: str
+
+
+class EvaluationRunRead(APIModel):
+    id: str
+    benchmark: str
+    engine: str
+    scenario_count: int
+    aggregate: dict[str, float]
+    categories: dict[str, dict[str, float]]
+    results: list[dict[str, Any]]
+    duration_ms: int
+    created_at: datetime
+
+
 class DatasourceCreate(APIModel):
     name: str = Field(min_length=1, max_length=120)
     type: Literal["prometheus", "loki", "elasticsearch", "kubernetes"]
-    base_url: HttpUrl
+    base_url: HttpUrl | None = None
+    kubeconfig: str | None = Field(default=None, max_length=1_000_000)
     secret_ref: str | None = None
     credential: str | None = None
     ca_cert: str | None = None
@@ -22,6 +59,7 @@ class DatasourceCreate(APIModel):
 class DatasourceUpdate(APIModel):
     name: str | None = Field(default=None, min_length=1, max_length=120)
     base_url: HttpUrl | None = None
+    kubeconfig: str | None = Field(default=None, max_length=1_000_000)
     secret_ref: str | None = None
     credential: str | None = None
     ca_cert: str | None = None
@@ -204,6 +242,124 @@ class FeedbackRead(FeedbackCreate):
     id: str
     report_id: str
     created_at: datetime
+
+
+class ChatMessage(APIModel):
+    role: Literal["user", "assistant"]
+    content: str = Field(min_length=1, max_length=8000)
+
+
+class ChatRequest(APIModel):
+    messages: list[ChatMessage] = Field(min_length=1, max_length=24)
+    incident_id: str | None = Field(default=None, max_length=40)
+
+
+class ChatToolCallRead(APIModel):
+    name: str
+    status: str
+    result_count: int
+    duration_ms: int
+    parameters: dict[str, Any] = Field(default_factory=dict)
+    error_code: str | None = None
+
+
+class ChatResponse(APIModel):
+    content: str
+    model_name: str
+    context_scope: str
+    tool_calls: list[ChatToolCallRead] = Field(default_factory=list)
+
+
+class InvestigationCreate(APIModel):
+    title: str = Field(min_length=1, max_length=500)
+    question: str = Field(min_length=1, max_length=8000)
+    incident_id: str | None = Field(default=None, max_length=40)
+
+
+class InvestigationMessageCreate(APIModel):
+    content: str = Field(min_length=1, max_length=8000)
+
+
+class InvestigationMessageRead(APIModel):
+    id: str
+    role: str
+    content: str
+    model_name: str | None
+    tool_calls: list[dict[str, Any]]
+    created_at: datetime
+
+
+class InvestigationStepRead(APIModel):
+    id: str
+    sequence: int
+    name: str
+    source: str
+    status: str
+    description: str | None
+    parameters: dict[str, Any]
+    result_count: int
+    duration_ms: int
+    error_code: str | None
+    created_at: datetime
+    completed_at: datetime | None
+
+
+class InvestigationEvidenceRead(APIModel):
+    id: str
+    step_id: str | None
+    source: str
+    title: str
+    summary: str
+    observed_at: datetime | None
+    subject: dict[str, Any]
+    values: dict[str, Any]
+    quality: float
+    created_at: datetime
+
+
+class InvestigationHypothesisRead(APIModel):
+    id: str
+    cause: str
+    confidence: float
+    status: str
+    supporting_evidence_ids: list[str]
+    contradicting_evidence_ids: list[str]
+    missing_evidence: list[str]
+    created_at: datetime
+    updated_at: datetime
+
+
+class InvestigationRead(APIModel):
+    id: str
+    incident_id: str | None
+    title: str
+    status: str
+    current_step: str | None
+    progress: float
+    model_name: str | None
+    summary: str | None
+    input_tokens: int
+    output_tokens: int
+    tool_count: int
+    error_code: str | None
+    error_message: str | None
+    share_token: str | None
+    started_at: datetime | None
+    completed_at: datetime | None
+    created_at: datetime
+    updated_at: datetime
+
+
+class InvestigationDetail(InvestigationRead):
+    messages: list[InvestigationMessageRead] = Field(default_factory=list)
+    steps: list[InvestigationStepRead] = Field(default_factory=list)
+    evidence: list[InvestigationEvidenceRead] = Field(default_factory=list)
+    hypotheses: list[InvestigationHypothesisRead] = Field(default_factory=list)
+
+
+class InvestigationShareRead(APIModel):
+    share_token: str
+    share_path: str
 
 
 QueryPackName = Literal[

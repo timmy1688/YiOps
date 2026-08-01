@@ -1,6 +1,6 @@
 [project]
 name = "yiops-backend"
-version = "0.1.0"
+version = "0.2.0"
 description = "Evidence-driven alert root cause analysis agent"
 requires-python = ">=3.12"
 dependencies = [
@@ -13,6 +13,7 @@ dependencies = [
   "openai>=1.99,<2",
   "pydantic>=2.11,<3",
   "pydantic-settings>=2.10,<3",
+  "PyYAML>=6,<7",
   "structlog>=25.4,<26",
   "tortoise-orm[asyncmy]>=1.1,<2",
   "uvicorn[standard]>=0.35,<1",
@@ -25,6 +26,7 @@ dev = [
   "pytest-asyncio>=1.1,<2",
   "respx>=0.22,<1",
   "ruff>=0.12,<1",
+  "types-PyYAML>=6.0.12,<7",
 ]
 
 [build-system]

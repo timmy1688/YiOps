@@ -1,0 +1,185 @@
+[
+  {
+    "id": "crashloop-config-001", "category": "configuration", "title": "支付服务配置缺失导致 CrashLoop",
+    "incident": {"service": "payment-api", "alert": "KubePodCrashLooping"},
+    "observations": [
+      {"id": "c1-log", "source": "loki", "summary": "startup failed: missing DB_URL environment variable from ConfigMap"},
+      {"id": "c1-k8s", "source": "kubernetes", "summary": "pod CrashLoopBackOff after ConfigMap checkout; missing DB_URL key"},
+      {"id": "c1-cpu", "source": "prometheus", "summary": "CPU remained below 20 percent"}
+    ],
+    "expected": {"cause_keywords": ["configmap", "环境变量"], "relevant_evidence_ids": ["c1-log", "c1-k8s"], "required_sources": ["loki", "kubernetes"]}
+  },
+  {
+    "id": "crashloop-config-002", "category": "configuration", "title": "订单服务 Secret 键名变更",
+    "incident": {"service": "order-api", "alert": "ContainerRestartRateHigh"},
+    "observations": [
+      {"id": "c2-log", "source": "loki", "summary": "missing DB_URL environment variable during bootstrap"},
+      {"id": "c2-k8s", "source": "kubernetes", "summary": "ConfigMap environment variable DB_URL is absent in new ReplicaSet"}
+    ],
+    "expected": {"cause_keywords": ["configmap", "环境变量"], "relevant_evidence_ids": ["c2-log", "c2-k8s"], "required_sources": ["loki", "kubernetes"]}
+  },
+  {
+    "id": "db-pool-001", "category": "database", "title": "流量尖峰耗尽数据库连接池",
+    "incident": {"service": "checkout", "alert": "Http5xxRateHigh"},
+    "observations": [
+      {"id": "d1-log", "source": "loki", "summary": "request failed: pool exhausted; connection timeout after 3000ms"},
+      {"id": "d1-db", "source": "prometheus", "summary": "database pool exhausted: active connections equals max connections"},
+      {"id": "d1-k8s", "source": "kubernetes", "summary": "all checkout pods remain Ready"}
+    ],
+    "expected": {"cause_keywords": ["连接池", "pool"], "relevant_evidence_ids": ["d1-log", "d1-db"], "required_sources": ["loki", "prometheus"]}
+  },
+  {
+    "id": "db-pool-002", "category": "database", "title": "连接泄漏引发持续超时",
+    "incident": {"service": "inventory", "alert": "DatabaseLatencyHigh"},
+    "observations": [
+      {"id": "d2-log", "source": "loki", "summary": "too many connections; pool exhausted while acquiring connection"},
+      {"id": "d2-metric", "source": "prometheus", "summary": "pool exhausted ratio held at 1.0 for ten minutes"}
+    ],
+    "expected": {"cause_keywords": ["连接池", "pool"], "relevant_evidence_ids": ["d2-log", "d2-metric"], "required_sources": ["loki", "prometheus"]}
+  },
+  {
+    "id": "disk-pressure-001", "category": "kubernetes", "title": "节点磁盘耗尽驱逐业务 Pod",
+    "incident": {"service": "catalog", "alert": "KubePodEvicted"},
+    "observations": [
+      {"id": "k1-node", "source": "kubernetes", "summary": "node condition DiskPressure=True and pod was Evicted"},
+      {"id": "k1-log", "source": "loki", "summary": "write failed: no space left on device before pod was evicted"},
+      {"id": "k1-cpu", "source": "prometheus", "summary": "CPU utilization is normal"}
+    ],
+    "expected": {"cause_keywords": ["磁盘", "disk"], "relevant_evidence_ids": ["k1-node", "k1-log"], "required_sources": ["kubernetes", "loki"]}
+  },
+  {
+    "id": "disk-pressure-002", "category": "kubernetes", "title": "容器日志填满节点临时盘",
+    "incident": {"service": "search-worker", "alert": "NodeDiskPressure"},
+    "observations": [
+      {"id": "k2-node", "source": "kubernetes", "summary": "DiskPressure condition triggered; workload pod Evicted"},
+      {"id": "k2-log", "source": "loki", "summary": "no space left while rotating application log"}
+    ],
+    "expected": {"cause_keywords": ["磁盘", "disk"], "relevant_evidence_ids": ["k2-node", "k2-log"], "required_sources": ["kubernetes", "loki"]}
+  },
+  {
+    "id": "oom-001", "category": "resource", "title": "报表进程内存峰值触发 OOM",
+    "incident": {"service": "report-worker", "alert": "ContainerOOMKilled"},
+    "observations": [
+      {"id": "m1-k8s", "source": "kubernetes", "summary": "last termination reason OOMKilled at memory limit"},
+      {"id": "m1-metric", "source": "prometheus", "summary": "working set reached memory limit immediately before OOMKilled"}
+    ],
+    "expected": {"cause_keywords": ["oom", "内存"], "relevant_evidence_ids": ["m1-k8s", "m1-metric"], "required_sources": ["kubernetes", "prometheus"]}
+  },
+  {
+    "id": "oom-002", "category": "resource", "title": "缓存无界增长导致容器退出",
+    "incident": {"service": "recommendation", "alert": "RestartRateHigh"},
+    "observations": [
+      {"id": "m2-log", "source": "loki", "summary": "out of memory allocating recommendation cache"},
+      {"id": "m2-k8s", "source": "kubernetes", "summary": "container OOMKilled after exceeding memory limit"}
+    ],
+    "expected": {"cause_keywords": ["oom", "内存"], "relevant_evidence_ids": ["m2-log", "m2-k8s"], "required_sources": ["loki", "kubernetes"]}
+  },
+  {
+    "id": "tls-expiry-001", "category": "dependency", "title": "网关上游证书过期",
+    "incident": {"service": "api-gateway", "alert": "UpstreamErrorsHigh"},
+    "observations": [
+      {"id": "t1-log", "source": "loki", "summary": "x509 certificate expired during TLS handshake"},
+      {"id": "t1-probe", "source": "prometheus", "summary": "blackbox probe failed: certificate expired"}
+    ],
+    "expected": {"cause_keywords": ["证书", "tls"], "relevant_evidence_ids": ["t1-log", "t1-probe"], "required_sources": ["loki", "prometheus"]}
+  },
+  {
+    "id": "tls-expiry-002", "category": "dependency", "title": "内部 CA 证书轮换遗漏",
+    "incident": {"service": "billing", "alert": "DependencyUnavailable"},
+    "observations": [
+      {"id": "t2-log", "source": "loki", "summary": "TLS handshake failure: x509 certificate expired"},
+      {"id": "t2-es", "source": "elasticsearch", "summary": "billing dependency error certificate expired"}
+    ],
+    "expected": {"cause_keywords": ["证书", "tls"], "relevant_evidence_ids": ["t2-log", "t2-es"], "required_sources": ["loki", "elasticsearch"]}
+  },
+  {
+    "id": "dns-001", "category": "network", "title": "CoreDNS 异常导致依赖解析失败",
+    "incident": {"service": "frontend", "alert": "DependencyErrorRateHigh"},
+    "observations": [
+      {"id": "n1-log", "source": "loki", "summary": "DNS name resolution failed for auth-service"},
+      {"id": "n1-k8s", "source": "kubernetes", "summary": "CoreDNS returned SERVFAIL for cluster service DNS"}
+    ],
+    "expected": {"cause_keywords": ["dns", "解析"], "relevant_evidence_ids": ["n1-log", "n1-k8s"], "required_sources": ["loki", "kubernetes"]}
+  },
+  {
+    "id": "dns-002", "category": "network", "title": "错误 search domain 引发解析超时",
+    "incident": {"service": "notification", "alert": "RequestLatencyHigh"},
+    "observations": [
+      {"id": "n2-log", "source": "loki", "summary": "DNS name resolution timeout after repeated SERVFAIL"},
+      {"id": "n2-metric", "source": "prometheus", "summary": "DNS request error ratio increased to 80 percent"}
+    ],
+    "expected": {"cause_keywords": ["dns", "解析"], "relevant_evidence_ids": ["n2-log", "n2-metric"], "required_sources": ["loki", "prometheus"]}
+  },
+  {
+    "id": "image-pull-001", "category": "deployment", "title": "发布引用不存在的镜像标签",
+    "incident": {"service": "profile", "alert": "KubeDeploymentReplicasMismatch"},
+    "observations": [
+      {"id": "i1-event", "source": "kubernetes", "summary": "ImagePullBackOff: registry manifest unknown for v2.8.9"},
+      {"id": "i1-change", "source": "yiops", "summary": "deployment changed image tag to v2.8.9 before ImagePullBackOff"}
+    ],
+    "expected": {"cause_keywords": ["镜像", "拉取"], "relevant_evidence_ids": ["i1-event", "i1-change"], "required_sources": ["kubernetes", "yiops"]}
+  },
+  {
+    "id": "image-pull-002", "category": "deployment", "title": "多架构镜像缺少节点平台",
+    "incident": {"service": "media", "alert": "PodPending"},
+    "observations": [
+      {"id": "i2-event", "source": "kubernetes", "summary": "ImagePullBackOff with manifest unknown for arm64"},
+      {"id": "i2-log", "source": "loki", "summary": "registry manifest unknown on image pull request"}
+    ],
+    "expected": {"cause_keywords": ["镜像", "拉取"], "relevant_evidence_ids": ["i2-event", "i2-log"], "required_sources": ["kubernetes", "loki"]}
+  },
+  {
+    "id": "cpu-throttle-001", "category": "resource", "title": "CPU limit 过低导致 P99 上升",
+    "incident": {"service": "pricing", "alert": "LatencyP99High"},
+    "observations": [
+      {"id": "p1-metric", "source": "prometheus", "summary": "CPU throttling ratio rose after CPU limit was reduced"},
+      {"id": "p1-k8s", "source": "kubernetes", "summary": "deployment CPU limit is 100m and container is throttled"}
+    ],
+    "expected": {"cause_keywords": ["cpu", "限流"], "relevant_evidence_ids": ["p1-metric", "p1-k8s"], "required_sources": ["prometheus", "kubernetes"]}
+  },
+  {
+    "id": "cpu-throttle-002", "category": "resource", "title": "计算任务 CPU 限流",
+    "incident": {"service": "risk-engine", "alert": "ProcessingDelayHigh"},
+    "observations": [
+      {"id": "p2-metric", "source": "prometheus", "summary": "container CPU throttled seconds increased at CPU limit"},
+      {"id": "p2-log", "source": "loki", "summary": "risk calculation exceeded deadline while CPU throttling active"}
+    ],
+    "expected": {"cause_keywords": ["cpu", "限流"], "relevant_evidence_ids": ["p2-metric", "p2-log"], "required_sources": ["prometheus", "loki"]}
+  },
+  {
+    "id": "probe-001", "category": "configuration", "title": "探针端口配置错误造成无流量",
+    "incident": {"service": "auth", "alert": "KubePodNotReady"},
+    "observations": [
+      {"id": "r1-event", "source": "kubernetes", "summary": "readiness probe failed with connection refused on port 9090"},
+      {"id": "r1-log", "source": "loki", "summary": "application listens on 8080 while readiness probe connection refused on 9090"}
+    ],
+    "expected": {"cause_keywords": ["探针", "readiness"], "relevant_evidence_ids": ["r1-event", "r1-log"], "required_sources": ["kubernetes", "loki"]}
+  },
+  {
+    "id": "probe-002", "category": "configuration", "title": "探针路径未随版本更新",
+    "incident": {"service": "customer", "alert": "EndpointsUnavailable"},
+    "observations": [
+      {"id": "r2-event", "source": "kubernetes", "summary": "readiness probe returned 404 after deployment"},
+      {"id": "r2-log", "source": "loki", "summary": "readiness probe path /healthz no longer exists"}
+    ],
+    "expected": {"cause_keywords": ["探针", "readiness"], "relevant_evidence_ids": ["r2-event", "r2-log"], "required_sources": ["kubernetes", "loki"]}
+  },
+  {
+    "id": "db-lock-001", "category": "database", "title": "批处理持锁造成在线请求阻塞",
+    "incident": {"service": "ledger", "alert": "DatabaseLatencyHigh"},
+    "observations": [
+      {"id": "l1-db", "source": "prometheus", "summary": "database lock wait duration jumped during batch job"},
+      {"id": "l1-log", "source": "loki", "summary": "transaction aborted due to deadlock and lock wait timeout"}
+    ],
+    "expected": {"cause_keywords": ["锁", "死锁"], "relevant_evidence_ids": ["l1-db", "l1-log"], "required_sources": ["prometheus", "loki"]}
+  },
+  {
+    "id": "db-lock-002", "category": "database", "title": "索引缺失放大行锁范围",
+    "incident": {"service": "coupon", "alert": "RequestTimeoutHigh"},
+    "observations": [
+      {"id": "l2-log", "source": "loki", "summary": "lock wait timeout while updating coupon table"},
+      {"id": "l2-es", "source": "elasticsearch", "summary": "deadlock detected across concurrent coupon updates"}
+    ],
+    "expected": {"cause_keywords": ["锁", "死锁"], "relevant_evidence_ids": ["l2-log", "l2-es"], "required_sources": ["loki", "elasticsearch"]}
+  }
+]

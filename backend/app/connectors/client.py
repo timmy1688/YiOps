@@ -1,5 +1,6 @@
 import asyncio
 import ssl
+import tempfile
 from datetime import UTC, datetime
 from time import monotonic
 from typing import Any
@@ -7,9 +8,12 @@ from typing import Any
 import httpx
 
 from app.agents.domain import QueryTemplate, ToolResult
+from app.analysis.evidence import redact
 from app.config import Settings
+from app.connectors.registry import registry
 from app.models import DatasourceConfig
 from app.security.credentials import CredentialVault
+from app.security.tenant import tenant_filter
 
 
 class DatasourceClient:
@@ -74,7 +78,7 @@ class DatasourceClient:
                     )
             result.duration_ms = int((monotonic() - started) * 1000)
             return result
-        except (httpx.HTTPError, RuntimeError, ValueError) as exc:
+        except (httpx.HTTPError, RuntimeError, ssl.SSLError, ValueError) as exc:
             return ToolResult(
                 source=template.source,
                 query_pack=template.query_pack,
@@ -85,22 +89,268 @@ class DatasourceClient:
                 data={"message": str(exc)[:500]},
             )
 
+    async def query_loki_logs(
+        self,
+        *,
+        query: str,
+        start: datetime,
+        end: datetime,
+        limit: int,
+    ) -> ToolResult:
+        started = monotonic()
+        query = query.strip()
+        if not query.startswith("{") or "}" not in query or len(query) > 1000:
+            raise ValueError("LogQL 必须以日志流选择器开头，且长度不能超过 1000 字符")
+        limit = min(max(limit, 1), 50)
+        if self.settings.datasource_mock_mode:
+            return ToolResult(
+                source="loki",
+                query_pack="chat",
+                template_id="chat_loki_logs",
+                status="completed",
+                result_count=2,
+                data={
+                    "query": query,
+                    "entries": [
+                        {
+                            "timestamp": end.isoformat(),
+                            "labels": {"service": "mock-service"},
+                            "line": "mock log entry",
+                        },
+                        {
+                            "timestamp": start.isoformat(),
+                            "labels": {"service": "mock-service"},
+                            "line": "mock previous log entry",
+                        },
+                    ][:limit],
+                },
+                duration_ms=int((monotonic() - started) * 1000),
+            )
+        datasource = await self._get_datasource("loki")
+        if datasource is None:
+            raise RuntimeError("未配置已启用的 Loki 数据源")
+        params = {
+            "query": query,
+            "start": int(start.astimezone(UTC).timestamp() * 1_000_000_000),
+            "end": int(end.astimezone(UTC).timestamp() * 1_000_000_000),
+            "limit": limit,
+            "direction": "backward",
+        }
+        async with httpx.AsyncClient(
+            timeout=self.settings.datasource_timeout_seconds,
+            trust_env=False,
+        ) as client:
+            response = await client.get(
+                f"{datasource.base_url.rstrip('/')}/loki/api/v1/query_range",
+                params=params,
+            )
+            response.raise_for_status()
+            payload = response.json()
+        entries = [
+            {
+                "timestamp_ns": str(value[0]),
+                "timestamp": datetime.fromtimestamp(int(value[0]) / 1_000_000_000, UTC).isoformat(),
+                "labels": stream.get("stream", {}),
+                "line": redact(str(value[1]))[:1000],
+            }
+            for stream in payload.get("data", {}).get("result", [])
+            for value in stream.get("values", [])
+            if len(value) == 2
+        ]
+        entries.sort(key=lambda item: item["timestamp_ns"], reverse=True)
+        for entry in entries:
+            entry.pop("timestamp_ns", None)
+        entries = entries[:limit]
+        return ToolResult(
+            source="loki",
+            query_pack="chat",
+            template_id="chat_loki_logs",
+            status="completed",
+            result_count=len(entries),
+            data={"query": query, "entries": entries},
+            duration_ms=int((monotonic() - started) * 1000),
+        )
+
+    async def query_prometheus_range(
+        self,
+        *,
+        query: str,
+        start: datetime,
+        end: datetime,
+        step_seconds: int,
+    ) -> ToolResult:
+        started = monotonic()
+        query = query.strip()
+        if not query or len(query) > 1000:
+            raise ValueError("PromQL 不能为空且长度不能超过 1000 字符")
+        if self.settings.datasource_mock_mode:
+            return ToolResult(
+                source="prometheus",
+                query_pack="chat",
+                template_id="chat_prometheus_range",
+                status="completed",
+                result_count=1,
+                data={"query": query, "series": [{"metric": {}, "values": []}]},
+                duration_ms=int((monotonic() - started) * 1000),
+            )
+        datasource = await self._get_datasource("prometheus")
+        if datasource is None:
+            raise RuntimeError("未配置已启用的 Prometheus 数据源")
+        params = {
+            "query": query,
+            "start": int(start.astimezone(UTC).timestamp()),
+            "end": int(end.astimezone(UTC).timestamp()),
+            "step": min(max(step_seconds, 15), 300),
+        }
+        async with httpx.AsyncClient(
+            timeout=self.settings.datasource_timeout_seconds,
+            trust_env=False,
+        ) as client:
+            response = await client.get(
+                f"{datasource.base_url.rstrip('/')}/api/v1/query_range",
+                params=params,
+            )
+            response.raise_for_status()
+            payload = response.json()
+        raw_series = payload.get("data", {}).get("result", [])[:20]
+        series = [
+            {
+                "metric": item.get("metric", {}),
+                "values": item.get("values", [])[-120:],
+            }
+            for item in raw_series
+        ]
+        return ToolResult(
+            source="prometheus",
+            query_pack="chat",
+            template_id="chat_prometheus_range",
+            status="completed",
+            result_count=len(series),
+            data={
+                "query": query,
+                "result_type": payload.get("data", {}).get("resultType"),
+                "series": series,
+            },
+            duration_ms=int((monotonic() - started) * 1000),
+        )
+
+    async def query_elasticsearch_logs(
+        self,
+        *,
+        query: str,
+        service: str | None,
+        start: datetime,
+        end: datetime,
+        limit: int,
+    ) -> ToolResult:
+        started = monotonic()
+        query = query.strip() or "*"
+        if len(query) > 500:
+            raise ValueError("日志搜索条件不能超过 500 字符")
+        limit = min(max(limit, 1), 50)
+        if self.settings.datasource_mock_mode:
+            return ToolResult(
+                source="elasticsearch",
+                query_pack="chat",
+                template_id="chat_elasticsearch_logs",
+                status="completed",
+                result_count=0,
+                data={"query": query, "entries": []},
+                duration_ms=int((monotonic() - started) * 1000),
+            )
+        datasource = await self._get_datasource("elasticsearch")
+        if datasource is None:
+            raise RuntimeError("未配置已启用的 Elasticsearch 数据源")
+        filters: list[dict[str, Any]] = [
+            {"range": {"@timestamp": {"gte": start.isoformat(), "lte": end.isoformat()}}}
+        ]
+        if service:
+            filters.append({"term": {"service.name": service}})
+        body = {
+            "size": limit,
+            "_source": ["@timestamp", "message", "service.name", "log.level"],
+            "sort": [{"@timestamp": "desc"}],
+            "query": {
+                "bool": {
+                    "filter": filters,
+                    "must": [{"simple_query_string": {"query": query}}],
+                }
+            },
+        }
+        index_alias = str(datasource.settings.get("index_alias", "logs-*"))
+        async with httpx.AsyncClient(
+            timeout=self.settings.datasource_timeout_seconds,
+            trust_env=False,
+        ) as client:
+            response = await client.post(
+                f"{datasource.base_url.rstrip('/')}/{index_alias}/_search",
+                json=body,
+            )
+            response.raise_for_status()
+            payload = response.json()
+        entries = [
+            {
+                "timestamp": hit.get("_source", {}).get("@timestamp"),
+                "service": hit.get("_source", {}).get("service.name"),
+                "level": hit.get("_source", {}).get("log.level"),
+                "message": redact(str(hit.get("_source", {}).get("message", "")))[:1000],
+            }
+            for hit in payload.get("hits", {}).get("hits", [])
+        ]
+        return ToolResult(
+            source="elasticsearch",
+            query_pack="chat",
+            template_id="chat_elasticsearch_logs",
+            status="completed",
+            result_count=len(entries),
+            data={"query": query, "entries": entries},
+            duration_ms=int((monotonic() - started) * 1000),
+        )
+
+    async def inspect_kubernetes(
+        self,
+        *,
+        inspection: str,
+        cluster: str | None,
+        namespace: str | None,
+        start: datetime,
+        end: datetime,
+    ) -> ToolResult:
+        template_ids = {
+            "abnormal_pods": "k8s_api_abnormal_pods",
+            "unhealthy_workloads": "k8s_api_workload_status",
+            "unhealthy_nodes": "k8s_api_node_conditions",
+            "warning_events": "k8s_api_warning_events",
+        }
+        template_id = template_ids.get(inspection)
+        if template_id is None:
+            raise ValueError("不支持的 Kubernetes 检查类型")
+        return await self.execute(
+            QueryTemplate(
+                id=template_id,
+                query_pack="chat",
+                source="kubernetes",
+                query=inspection,
+                kind="object",
+                title=f"Kubernetes {inspection}",
+            ),
+            service="kubernetes-cluster",
+            cluster=cluster,
+            namespace=namespace,
+            start=start,
+            end=end,
+        )
+
     async def test_connection(self, datasource: DatasourceConfig) -> tuple[bool, str]:
         if self.settings.datasource_mock_mode:
             return True, "mock mode"
-        path = {
-            "prometheus": "/-/healthy",
-            "loki": "/ready",
-            "elasticsearch": "/",
-            "kubernetes": "/version",
-        }[datasource.type]
+        path = registry.get(datasource.type).health_path
         try:
             headers: dict[str, str] = {}
             verify: bool | ssl.SSLContext = True
             if datasource.type == "kubernetes":
                 secrets = self.vault.decrypt(datasource.secret_ref)
-                if secrets.get("token"):
-                    headers["Authorization"] = f"Bearer {secrets['token']}"
+                headers = self._kubernetes_headers(secrets)
                 verify = self._kubernetes_verify(datasource, secrets)
             async with httpx.AsyncClient(
                 timeout=self.settings.datasource_timeout_seconds,
@@ -114,7 +364,7 @@ class DatasourceClient:
                 version = response.json().get("gitVersion", "unknown")
                 return True, f"connected ({version})"
             return True, "connected"
-        except httpx.HTTPError as exc:
+        except (httpx.HTTPError, RuntimeError, ssl.SSLError, ValueError) as exc:
             return False, str(exc)[:500]
 
     async def _get_datasource(
@@ -122,7 +372,11 @@ class DatasourceClient:
         source: str,
         cluster: str | None = None,
     ) -> DatasourceConfig | None:
-        items = await DatasourceConfig.filter(type=source, enabled=True).order_by("created_at")
+        items = await DatasourceConfig.filter(
+            type=source,
+            enabled=True,
+            **tenant_filter(),
+        ).order_by("created_at")
         if not items:
             return None
         if source == "kubernetes" and cluster:
@@ -292,10 +546,7 @@ class DatasourceClient:
         end: datetime,
     ) -> ToolResult:
         secrets = self.vault.decrypt(datasource.secret_ref)
-        token = secrets.get("token")
-        if not token:
-            raise RuntimeError("Kubernetes datasource has no ServiceAccount token")
-        headers = {"Authorization": f"Bearer {token}"}
+        headers = self._kubernetes_headers(secrets)
         verify = self._kubernetes_verify(datasource, secrets)
         configured_namespace = str(datasource.settings.get("default_namespace", "")).strip()
         scope = (namespace or configured_namespace).strip()
@@ -563,16 +814,43 @@ class DatasourceClient:
             return None
 
     @staticmethod
+    def _kubernetes_headers(secrets: dict[str, str]) -> dict[str, str]:
+        token = secrets.get("token", "").strip()
+        if token:
+            return {"Authorization": f"Bearer {token}"}
+        if secrets.get("client_cert") and secrets.get("client_key"):
+            return {}
+        raise RuntimeError("Kubernetes 数据源没有可用的 Token 或客户端证书")
+
+    @staticmethod
     def _kubernetes_verify(
         datasource: DatasourceConfig,
         secrets: dict[str, str],
     ) -> bool | ssl.SSLContext:
-        if not bool(datasource.settings.get("verify_ssl", True)):
-            return False
+        verify_ssl = bool(datasource.settings.get("verify_ssl", True))
         ca_cert = secrets.get("ca_cert")
-        if ca_cert:
-            return ssl.create_default_context(cadata=ca_cert)
-        return True
+        client_cert = secrets.get("client_cert")
+        client_key = secrets.get("client_key")
+        if not client_cert and not client_key:
+            if not verify_ssl:
+                return False
+            return ssl.create_default_context(cadata=ca_cert) if ca_cert else True
+
+        context = (
+            ssl.create_default_context(cadata=ca_cert)
+            if verify_ssl
+            else ssl._create_unverified_context()  # noqa: SLF001
+        )
+        with (
+            tempfile.NamedTemporaryFile(mode="w", encoding="utf-8") as cert_file,
+            tempfile.NamedTemporaryFile(mode="w", encoding="utf-8") as key_file,
+        ):
+            cert_file.write(client_cert or "")
+            cert_file.flush()
+            key_file.write(client_key or "")
+            key_file.flush()
+            context.load_cert_chain(certfile=cert_file.name, keyfile=key_file.name)
+        return context
 
     async def _mock_execute(
         self,

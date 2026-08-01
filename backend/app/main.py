@@ -10,6 +10,9 @@ from starlette.exceptions import HTTPException
 from starlette.types import Scope
 
 from app.agents.graph import AnalysisAgent
+from app.api.demos import router as demos_router
+from app.api.evaluations import router as evaluations_router
+from app.api.investigations import router as investigations_router
 from app.api.router import router
 from app.config import get_settings
 from app.connectors.client import DatasourceClient
@@ -17,6 +20,9 @@ from app.db import close_db, init_db
 from app.llm.deepseek import DeepSeekClient
 from app.runtime.events import EventBroker
 from app.runtime.supervisor import AnalysisSupervisor
+from app.security.auth import AuthenticationMiddleware, ensure_bootstrap_identity
+from app.security.auth import router as auth_router
+from app.services.investigations import InvestigationRunner, InvestigationSupervisor
 
 settings = get_settings()
 frontend_dist = Path(__file__).resolve().parents[2] / "frontend" / "dist"
@@ -41,25 +47,33 @@ class SPAStaticFiles(StaticFiles):
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     await init_db()
+    await ensure_bootstrap_identity(settings)
     events = EventBroker()
     datasource_client = DatasourceClient(settings)
     llm = DeepSeekClient(settings)
     agent = AnalysisAgent(settings, datasource_client, llm, events)
     supervisor = AnalysisSupervisor(agent, settings.analysis_concurrency)
+    investigation_runner = InvestigationRunner(datasource_client, llm, events)
+    investigation_supervisor = InvestigationSupervisor(
+        investigation_runner, settings.analysis_concurrency
+    )
     app.state.events = events
     app.state.datasource_client = datasource_client
     app.state.supervisor = supervisor
+    app.state.investigation_supervisor = investigation_supervisor
     await supervisor.start()
+    await investigation_supervisor.start()
     try:
         yield
     finally:
+        await investigation_supervisor.stop()
         await supervisor.stop()
         await close_db()
 
 
 app = FastAPI(
     title=settings.app_name,
-    version="0.1.0",
+    version="0.2.0",
     lifespan=lifespan,
 )
 app.add_middleware(
@@ -69,7 +83,12 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.add_middleware(AuthenticationMiddleware, settings=settings)
+app.include_router(auth_router, prefix=settings.api_prefix)
 app.include_router(router, prefix=settings.api_prefix)
+app.include_router(investigations_router, prefix=settings.api_prefix)
+app.include_router(evaluations_router, prefix=settings.api_prefix)
+app.include_router(demos_router, prefix=settings.api_prefix)
 
 if frontend_dist.is_dir():
     app.mount(

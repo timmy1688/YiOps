@@ -1,13 +1,15 @@
 <script setup lang="ts">
-import { Connection, Delete as DeleteIcon, Plus } from '@element-plus/icons-vue'
-import { ElMessage, ElMessageBox } from 'element-plus'
+import { Connection, Delete as DeleteIcon, Plus, UploadFilled } from '@element-plus/icons-vue'
+import { ElMessage, ElMessageBox, type UploadFile } from 'element-plus'
 import { onMounted, reactive, ref, watch } from 'vue'
 
 import {
   createDatasource,
   deleteDatasource,
+  listConnectorTypes,
   listDatasources,
   testDatasource,
+  type ConnectorType,
   type Datasource,
   type DatasourceInput,
 } from '@/api/client'
@@ -18,11 +20,14 @@ const testingId = ref('')
 const deletingId = ref('')
 const loading = ref(false)
 const datasources = ref<Datasource[]>([])
+const connectorTypes = ref<ConnectorType[]>([])
+const kubeconfigFilename = ref('')
 const form = reactive<
   DatasourceInput & {
     cluster_id: string
     default_namespace: string
     verify_ssl: boolean
+    kubeconfig: string
   }
 >({
   name: '',
@@ -34,19 +39,29 @@ const form = reactive<
   cluster_id: '',
   default_namespace: '',
   verify_ssl: true,
+  kubeconfig: '',
 })
 
 watch(
   () => form.type,
   (type) => {
-    form.base_url = type === 'kubernetes' ? 'https://' : 'http://'
+    form.base_url = type === 'kubernetes' ? '' : 'http://'
+    if (type !== 'kubernetes') {
+      form.kubeconfig = ''
+      kubeconfigFilename.value = ''
+    }
   },
 )
 
 async function loadDatasources() {
   loading.value = true
   try {
-    datasources.value = await listDatasources()
+    const [items, connectors] = await Promise.all([
+      listDatasources(),
+      listConnectorTypes(),
+    ])
+    datasources.value = items
+    connectorTypes.value = connectors
   } catch {
     ElMessage.error('数据源加载失败')
   } finally {
@@ -57,12 +72,19 @@ async function loadDatasources() {
 onMounted(() => void loadDatasources())
 
 async function submit() {
-  if (!form.name.trim() || !form.base_url.replace(/^https?:\/\//, '').trim()) {
-    ElMessage.warning('请填写名称和数据源地址')
+  if (!form.name.trim()) {
+    ElMessage.warning('请填写数据源名称')
     return
   }
-  if (form.type === 'kubernetes' && (!form.cluster_id.trim() || !form.credential?.trim())) {
-    ElMessage.warning('Kubernetes 数据源必须填写集群标识和 ServiceAccount Token')
+  if (form.type === 'kubernetes' && !form.kubeconfig.trim()) {
+    ElMessage.warning('请选择 kubeconfig 文件')
+    return
+  }
+  if (
+    form.type !== 'kubernetes' &&
+    !form.base_url?.replace(/^https?:\/\//, '').trim()
+  ) {
+    ElMessage.warning('请填写数据源地址')
     return
   }
   submitting.value = true
@@ -70,25 +92,48 @@ async function submit() {
     await createDatasource({
       name: form.name.trim(),
       type: form.type,
-      base_url: form.base_url.trim(),
+      base_url: form.type === 'kubernetes' ? undefined : form.base_url?.trim(),
+      kubeconfig: form.type === 'kubernetes' ? form.kubeconfig : undefined,
       enabled: form.enabled,
-      credential: form.type === 'kubernetes' ? form.credential?.trim() : undefined,
-      ca_cert: form.type === 'kubernetes' ? form.ca_cert?.trim() : undefined,
-      settings:
-        form.type === 'kubernetes'
-          ? {
-              cluster_id: form.cluster_id.trim(),
-              default_namespace: form.default_namespace.trim(),
-              verify_ssl: form.verify_ssl,
-            }
-          : {},
+      settings: {},
     })
     dialogVisible.value = false
     await loadDatasources()
     ElMessage.success('数据源已添加')
+  } catch (error) {
+    const detail = (error as { response?: { data?: { detail?: string } } }).response?.data
+      ?.detail
+    ElMessage.error(detail || '数据源添加失败')
   } finally {
     submitting.value = false
   }
+}
+
+async function selectKubeconfig(file: UploadFile) {
+  if (!file.raw) return
+  if (file.raw.size > 1_000_000) {
+    ElMessage.error('kubeconfig 文件不能超过 1 MB')
+    return
+  }
+  form.kubeconfig = await file.raw.text()
+  kubeconfigFilename.value = file.name
+}
+
+function openCreate() {
+  Object.assign(form, {
+    name: '',
+    type: 'prometheus',
+    base_url: 'http://',
+    enabled: true,
+    credential: '',
+    ca_cert: '',
+    cluster_id: '',
+    default_namespace: '',
+    verify_ssl: true,
+    kubeconfig: '',
+  })
+  kubeconfigFilename.value = ''
+  dialogVisible.value = true
 }
 
 async function test(item: Datasource) {
@@ -139,7 +184,7 @@ async function remove(item: Datasource) {
         <h1>数据源</h1>
         <p class="page-subtitle">所有连接器均以只读方式访问，模型无法获得凭据。</p>
       </div>
-      <el-button type="primary" :icon="Plus" @click="dialogVisible = true">
+      <el-button type="primary" :icon="Plus" @click="openCreate">
         添加数据源
       </el-button>
     </header>
@@ -200,56 +245,42 @@ async function remove(item: Datasource) {
         <el-form-item label="名称"><el-input v-model="form.name" /></el-form-item>
         <el-form-item label="类型">
           <el-select v-model="form.type">
-            <el-option label="Prometheus" value="prometheus" />
-            <el-option label="Loki" value="loki" />
-            <el-option label="Elasticsearch" value="elasticsearch" />
-            <el-option label="Kubernetes 集群" value="kubernetes" />
+            <el-option
+              v-for="connector in connectorTypes"
+              :key="connector.type"
+              :label="connector.display_name"
+              :value="connector.type"
+            />
           </el-select>
         </el-form-item>
-        <el-form-item :label="form.type === 'kubernetes' ? 'API Server 地址' : '地址'">
-          <el-input
-            v-model="form.base_url"
-            :placeholder="
-              form.type === 'kubernetes'
-                ? '例如：https://k8s-api.example.com:6443'
-                : '例如：http://prometheus:9090'
-            "
-          />
+        <el-form-item v-if="form.type !== 'kubernetes'" label="地址">
+          <el-input v-model="form.base_url" placeholder="例如：http://prometheus:9090" />
         </el-form-item>
         <template v-if="form.type === 'kubernetes'">
-          <div class="form-grid">
-            <el-form-item label="集群标识">
-              <el-input
-                v-model="form.cluster_id"
-                placeholder="必须与告警中的 cluster 一致"
-              />
-            </el-form-item>
-            <el-form-item label="默认 Namespace（可选）">
-              <el-input v-model="form.default_namespace" placeholder="留空表示全部" />
-            </el-form-item>
-          </div>
-          <el-form-item label="ServiceAccount Token">
-            <el-input
-              v-model="form.credential"
-              type="password"
-              show-password
-              placeholder="仅授予 get/list/watch 权限"
-            />
-          </el-form-item>
-          <el-form-item label="CA 证书（PEM，可选）">
-            <el-input
-              v-model="form.ca_cert"
-              type="textarea"
-              :rows="5"
-              placeholder="-----BEGIN CERTIFICATE-----"
-            />
-          </el-form-item>
-          <el-form-item class="switch-form-item">
-            <div>
-              <strong>校验 API Server 证书</strong>
-              <span>生产环境建议开启；实验环境无 CA 时可关闭</span>
+          <el-form-item label="kubeconfig 文件">
+            <el-upload
+              class="kubeconfig-upload"
+              drag
+              accept=".yaml,.yml,.conf"
+              :auto-upload="false"
+              :on-change="selectKubeconfig"
+              :show-file-list="false"
+            >
+              <el-icon class="el-icon--upload"><UploadFilled /></el-icon>
+              <div class="el-upload__text">
+                拖入 kubeconfig，或<em>点击选择</em>
+              </div>
+              <template #tip>
+                <div class="el-upload__tip">
+                  自动读取当前 context、API Server 和凭据，最大 1 MB
+                </div>
+              </template>
+            </el-upload>
+            <div v-if="kubeconfigFilename" class="selected-kubeconfig">
+              <Connection />
+              <span>{{ kubeconfigFilename }}</span>
+              <b>已读取</b>
             </div>
-            <el-switch v-model="form.verify_ssl" />
           </el-form-item>
         </template>
         <el-form-item><el-switch v-model="form.enabled" />&nbsp;启用</el-form-item>

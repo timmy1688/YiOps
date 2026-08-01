@@ -18,6 +18,12 @@ class Settings(BaseSettings):
     auto_create_tables: bool = True
     cors_origins: list[str] = ["http://localhost:5173", "http://127.0.0.1:5173"]
 
+    auth_enabled: bool = False
+    admin_username: str = "admin"
+    admin_password: str = ""
+    session_ttl_hours: int = Field(default=168, ge=1, le=720)
+    auth_cookie_secure: bool = False
+
     deepseek_api_key: str = ""
     deepseek_base_url: str = "https://api.deepseek.com"
     deepseek_model: str = "deepseek-v4-pro"

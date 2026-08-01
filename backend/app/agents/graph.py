@@ -21,6 +21,7 @@ from app.models import (
 )
 from app.runtime.events import EventBroker
 from app.schemas import RootCauseOutput
+from app.security.tenant import set_tenant_id
 from app.tools.catalog import TEMPLATES_BY_ID, templates_for_packs
 
 
@@ -84,6 +85,8 @@ class AnalysisAgent:
     async def run(self, run_id: str) -> None:
         run = await AnalysisRun.get(id=run_id)
         incident = await Incident.get(id=run.incident_id)
+        # Supervisor workers are long-lived tasks; set the workspace before every run.
+        set_tenant_id(incident.tenant_id)
         latest_alert = (
             await AlertEvent.filter(incident_id=incident.id).order_by("-created_at").first()
         )

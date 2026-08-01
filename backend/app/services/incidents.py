@@ -5,9 +5,13 @@ from typing import Any
 
 from app.models import AlertEvent, Incident, new_id
 from app.schemas import ManualIncidentCreate
+from app.security.tenant import DEFAULT_TENANT_ID
 
 
-async def create_manual_incident(payload: ManualIncidentCreate) -> Incident:
+async def create_manual_incident(
+    payload: ManualIncidentCreate,
+    tenant_id: str = DEFAULT_TENANT_ID,
+) -> Incident:
     alert = {
         "alert_name": payload.alert_name,
         "service": payload.service,
@@ -20,12 +24,13 @@ async def create_manual_incident(payload: ManualIncidentCreate) -> Incident:
         "labels": payload.labels,
         "annotations": payload.annotations,
     }
-    return await create_or_aggregate_alert(alert, source="manual")
+    return await create_or_aggregate_alert(alert, source="manual", tenant_id=tenant_id)
 
 
 async def ingest_alertmanager(
     payload: dict[str, Any],
     *,
+    tenant_id: str = DEFAULT_TENANT_ID,
     default_cluster: str | None = None,
     default_namespace: str | None = None,
 ) -> list[Incident]:
@@ -50,7 +55,13 @@ async def ingest_alertmanager(
             "labels": labels,
             "annotations": annotations,
         }
-        incidents.append(await create_or_aggregate_alert(alert, source="alertmanager"))
+        incidents.append(
+            await create_or_aggregate_alert(
+                alert,
+                source="alertmanager",
+                tenant_id=tenant_id,
+            )
+        )
     return incidents
 
 
@@ -58,6 +69,7 @@ async def create_or_aggregate_alert(
     alert: dict[str, Any],
     *,
     source: str,
+    tenant_id: str = DEFAULT_TENANT_ID,
 ) -> Incident:
     started_at = _ensure_utc(alert["started_at"])
     alert_status = str(alert.get("status", "firing")).lower()
@@ -65,6 +77,7 @@ async def create_or_aggregate_alert(
     aggregation_key = _aggregation_key(alert, started_at)
     fingerprint = str(alert.get("external_id") or _fingerprint(alert))
     duplicate = await AlertEvent.get_or_none(
+        tenant_id=tenant_id,
         fingerprint=fingerprint,
         started_at=started_at,
     )
@@ -80,11 +93,16 @@ async def create_or_aggregate_alert(
             )
         return incident
 
-    incident = await Incident.get_or_none(aggregation_key=aggregation_key, status="open")
+    incident = await Incident.get_or_none(
+        tenant_id=tenant_id,
+        aggregation_key=aggregation_key,
+        status="open",
+    )
     if incident is None:
         resolved = _is_resolved(alert_status)
         incident = await Incident.create(
             id=new_id("inc"),
+            tenant_id=tenant_id,
             aggregation_key=aggregation_key,
             title=f"{alert['alert_name']} · {alert['service']}",
             service=str(alert["service"]),
@@ -104,6 +122,7 @@ async def create_or_aggregate_alert(
 
     await AlertEvent.create(
         id=new_id("alert"),
+        tenant_id=tenant_id,
         source=source,
         external_id=alert.get("external_id"),
         fingerprint=fingerprint,
