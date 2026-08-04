@@ -14,6 +14,5 @@ logs/
 .mypy_cache/
 .ruff_cache/
 
-# Local test environment inventory and live cluster overrides
-docs/test-environment.md
+# Local live cluster overrides
 deploy/k8s/observability-nodeports.yaml
