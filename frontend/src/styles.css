@@ -1076,6 +1076,11 @@ textarea {
   background: var(--green-soft);
 }
 
+.datasource-icon.tempo {
+  color: #7f56d9;
+  background: #f4f0ff;
+}
+
 .datasource-icon svg {
   width: 21px;
 }
@@ -1521,51 +1526,79 @@ body {
   line-height: 1.65;
 }
 
-.kubeconfig-upload,
-.kubeconfig-upload .el-upload,
-.kubeconfig-upload .el-upload-dragger {
-  width: 100%;
+.wiki-search {
+  margin-bottom: 20px;
+  padding: 18px;
 }
 
-.kubeconfig-upload .el-upload-dragger {
-  padding: 30px 18px;
-  border-color: #d7dee8;
+.wiki-header-actions {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+}
+
+.wiki-file-input {
+  display: none;
+}
+
+.wiki-results {
+  display: grid;
+  gap: 12px;
+  margin-top: 16px;
+}
+
+.wiki-results article {
+  padding: 14px;
+  border: 1px solid #e7ebf0;
+  border-radius: 8px;
   background: #fafbfc;
 }
 
-.kubeconfig-upload .el-upload-dragger:hover {
-  border-color: #5b8def;
-  background: #f7faff;
+.wiki-results strong,
+.wiki-results small {
+  display: block;
 }
 
-.selected-kubeconfig {
+.wiki-results small,
+.wiki-card small {
+  color: #667085;
+}
+
+.wiki-results p,
+.wiki-card > p {
+  margin: 8px 0 0;
+  color: #475467;
+  line-height: 1.65;
+  white-space: pre-wrap;
+}
+
+.wiki-grid {
   display: grid;
-  grid-template-columns: 18px minmax(0, 1fr) auto;
-  align-items: center;
-  gap: 10px;
-  width: 100%;
-  margin-top: 12px;
-  padding: 10px 12px;
-  border: 1px solid #ccebd8;
-  border-radius: 8px;
-  background: #f4fbf7;
-  color: #344054;
+  grid-template-columns: repeat(auto-fill, minmax(340px, 1fr));
+  gap: 18px;
 }
 
-.selected-kubeconfig svg {
-  width: 18px;
-  color: #17a673;
+.wiki-card {
+  padding: 20px;
 }
 
-.selected-kubeconfig span {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+.wiki-card-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
 }
 
-.selected-kubeconfig b {
-  color: #16845d;
-  font-size: 12px;
+.wiki-card-head h3 {
+  margin: 0 0 5px;
+}
+
+.wiki-tags,
+.wiki-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 16px;
 }
 
 .el-drawer__header {
@@ -2749,6 +2782,12 @@ body {
   background: #f2f4f7;
 }
 
+.chat-head-actions button:disabled {
+  color: #c5cad3;
+  cursor: not-allowed;
+  background: transparent;
+}
+
 .chat-head-actions svg {
   width: 15px;
 }
@@ -2771,6 +2810,40 @@ body {
   border-radius: 50%;
   background: #5f7fee;
   box-shadow: 0 0 0 3px #e9edff;
+}
+
+.chat-context > span {
+  flex: 0 0 auto;
+}
+
+.chat-conversation-select {
+  width: min(220px, 52%);
+  margin-left: auto;
+}
+
+.chat-conversation-select .el-select__wrapper {
+  min-height: 28px;
+  border-radius: 7px;
+  background: #fff;
+  box-shadow: 0 0 0 1px #e2e6ed inset;
+}
+
+.chat-conversation-option {
+  display: flex;
+  width: 100%;
+  align-items: center;
+  gap: 12px;
+}
+
+.chat-conversation-option b {
+  overflow: hidden;
+  flex: 1;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.chat-conversation-option small {
+  color: #98a2b3;
 }
 
 .chat-messages {

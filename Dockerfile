@@ -33,7 +33,7 @@ COPY --from=frontend-build --chown=yiops:yiops /build/frontend/dist/ /app/fronte
 USER yiops
 WORKDIR /app/backend
 
-EXPOSE 8100
+EXPOSE 8100 8110
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
     CMD ["python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8100/api/v1/health/ready', timeout=3)"]

@@ -1,12 +1,12 @@
 import asyncio
 from contextlib import suppress
 
-from app.agents.graph import AnalysisAgent
+from app.agents.rca import RcaAgent
 from app.models import AnalysisRun
 
 
-class AnalysisSupervisor:
-    def __init__(self, agent: AnalysisAgent, concurrency: int) -> None:
+class RcaSupervisor:
+    def __init__(self, agent: RcaAgent, concurrency: int) -> None:
         self.agent = agent
         self.concurrency = concurrency
         self.queue: asyncio.Queue[str] = asyncio.Queue()

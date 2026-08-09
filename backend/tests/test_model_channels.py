@@ -1,12 +1,13 @@
-from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
+from langchain_core.messages import AIMessage
 
+from app.agents.tools import available_tool_specs
 from app.config import Settings
-from app.llm import deepseek
-from app.llm.deepseek import DeepSeekClient, ModelRuntime
-from app.schemas import AnalysisModelConfigUpsert
+from app.llm import gateway
+from app.llm.gateway import ModelGateway, ModelRuntime
+from app.schemas import AnalysisModelConfigUpsert, QueryPackPlan
 
 
 def test_model_channel_defaults_to_openai_compatible() -> None:
@@ -32,171 +33,116 @@ def test_legacy_deepseek_provider_is_still_accepted() -> None:
     assert payload.provider == "deepseek"
 
 
+def test_legacy_model_environment_names_remain_supported(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("YIOPS_MODEL_API_KEY", raising=False)
+    monkeypatch.delenv("YIOPS_MODEL_BASE_URL", raising=False)
+    monkeypatch.delenv("YIOPS_MODEL_NAME", raising=False)
+    monkeypatch.setenv("YIOPS_DEEPSEEK_API_KEY", "legacy-key")
+    monkeypatch.setenv("YIOPS_DEEPSEEK_BASE_URL", "https://legacy.example.com/v1")
+    monkeypatch.setenv("YIOPS_DEEPSEEK_MODEL", "legacy-model")
+
+    settings = Settings(_env_file=None)
+
+    assert settings.model_api_key == "legacy-key"
+    assert settings.model_base_url == "https://legacy.example.com/v1"
+    assert settings.model_name == "legacy-model"
+
+
 @pytest.mark.asyncio
-async def test_connection_uses_only_openai_compatible_parameters(
+async def test_connection_uses_langchain_openai_compatible_model(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     captured: dict[str, Any] = {}
 
-    class Completions:
-        async def create(self, **kwargs: Any) -> Any:
-            captured.update(kwargs)
-            return SimpleNamespace(
-                choices=[SimpleNamespace(message=SimpleNamespace(content="OK"))]
-            )
+    class Model:
+        async def ainvoke(self, messages: list[Any], **kwargs: Any) -> AIMessage:
+            captured["messages"] = messages
+            captured["invoke"] = kwargs
+            return AIMessage(content="OK")
 
-    def client_factory(**kwargs: Any) -> Any:
-        captured["client"] = kwargs
-        return SimpleNamespace(chat=SimpleNamespace(completions=Completions()))
+    def model_factory(**kwargs: Any) -> Model:
+        captured["model"] = kwargs
+        return Model()
 
-    monkeypatch.setattr(deepseek, "AsyncOpenAI", client_factory)
+    monkeypatch.setattr(gateway, "ChatOpenAI", model_factory)
 
-    message = await DeepSeekClient.test_connection(
+    message = await ModelGateway.test_connection(
         api_key="test-key",
         base_url="https://models.example.com/v1",
         model_name="analysis-model",
     )
 
     assert message == "模型响应正常：OK"
-    assert captured["client"] == {
+    assert captured["model"] == {
         "api_key": "test-key",
         "base_url": "https://models.example.com/v1",
+        "model": "analysis-model",
         "timeout": 30.0,
+        "max_retries": 2,
+        "streaming": True,
     }
-    assert captured["model"] == "analysis-model"
-    assert "extra_body" not in captured
+    assert captured["messages"][0].content.startswith("Reply with exactly OK")
+    assert captured["invoke"] == {"max_tokens": 8}
+
+
+def test_chat_only_exposes_tools_for_configured_datasources() -> None:
+    tools = available_tool_specs(
+        {
+            "available_datasources": [
+                {"name": "Prometheus", "type": "prometheus"},
+                {"name": "Kubernetes", "type": "kubernetes"},
+            ]
+        }
+    )
+
+    names = {item.name for item in tools}
+    assert names == {"get_incident_analysis", "query_prometheus", "inspect_kubernetes"}
 
 
 @pytest.mark.asyncio
-async def test_chat_includes_yiops_context_and_history(
+async def test_planning_uses_langchain_structured_output(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     captured: dict[str, Any] = {}
 
-    class Completions:
-        async def create(self, **kwargs: Any) -> Any:
-            captured.update(kwargs)
-            return SimpleNamespace(
-                choices=[SimpleNamespace(message=SimpleNamespace(content="  分析结果  "))],
-                usage=SimpleNamespace(prompt_tokens=12, completion_tokens=4),
-            )
+    class Runnable:
+        async def ainvoke(self, messages: list[Any]) -> dict[str, Any]:
+            captured["messages"] = messages
+            return {
+                "raw": AIMessage(
+                    content='{"query_packs":["service_health"]}',
+                    usage_metadata={"input_tokens": 9, "output_tokens": 3, "total_tokens": 12},
+                ),
+                "parsed": QueryPackPlan(query_packs=["service_health"]),
+                "parsing_error": None,
+            }
 
-    client = DeepSeekClient(Settings())
+    class Model:
+        def with_structured_output(self, schema: type[Any], **kwargs: Any) -> Runnable:
+            captured["schema"] = schema
+            captured["options"] = kwargs
+            return Runnable()
+
+    client = ModelGateway(Settings())
 
     async def runtime() -> ModelRuntime:
-        model_client = SimpleNamespace(chat=SimpleNamespace(completions=Completions()))
         return ModelRuntime(
-            client=cast(Any, model_client),
-            model_name="chat-model",
+            model=cast(Any, Model()),
+            model_name="structured-model",
             is_local=False,
         )
 
     monkeypatch.setattr(client, "runtime", runtime)
-    result = await client.chat(
-        [{"role": "user", "content": "发生了什么？"}],
-        {"scope": "incident", "incident": {"title": "CPU 告警"}},
-    )
+    result = await client.plan({"alert_name": "HighLatency"})
 
-    assert result.content == "分析结果"
-    assert result.model_name == "chat-model"
-    assert result.input_tokens == 12
-    assert captured["messages"][1] == {"role": "user", "content": "发生了什么？"}
-    assert "<yiops_context>" in captured["messages"][0]["content"]
-    assert "CPU 告警" in captured["messages"][0]["content"]
-
-
-@pytest.mark.asyncio
-async def test_chat_local_mode_explains_model_configuration(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    client = DeepSeekClient(Settings())
-
-    async def runtime() -> ModelRuntime:
-        return ModelRuntime(client=None, model_name="local-evidence-rules", is_local=True)
-
-    monkeypatch.setattr(client, "runtime", runtime)
-    result = await client.chat(
-        [{"role": "user", "content": "帮我分析"}],
-        {"scope": "overview"},
-    )
-
-    assert "分析模型" in result.content
-    assert result.model_name == "local-evidence-rules"
-
-
-@pytest.mark.asyncio
-async def test_chat_executes_datasource_tool_and_returns_final_answer(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    requests: list[dict[str, Any]] = []
-
-    class Completions:
-        async def create(self, **kwargs: Any) -> Any:
-            requests.append(kwargs)
-            if len(requests) == 1:
-                tool_call = SimpleNamespace(
-                    id="call-1",
-                    function=SimpleNamespace(
-                        name="query_loki_logs",
-                        arguments='{"query":"{namespace=~\\".+\\"}","limit":10}',
-                    ),
-                )
-                message = SimpleNamespace(content=None, tool_calls=[tool_call])
-                message.model_dump = lambda **_kwargs: {
-                    "role": "assistant",
-                    "tool_calls": [
-                        {
-                            "id": "call-1",
-                            "type": "function",
-                            "function": {
-                                "name": "query_loki_logs",
-                                "arguments": tool_call.function.arguments,
-                            },
-                        }
-                    ],
-                }
-            else:
-                message = SimpleNamespace(content="找到 10 条 Loki 日志", tool_calls=None)
-            return SimpleNamespace(
-                choices=[SimpleNamespace(message=message)],
-                usage=SimpleNamespace(prompt_tokens=10, completion_tokens=5),
-            )
-
-    client = DeepSeekClient(Settings())
-
-    async def runtime() -> ModelRuntime:
-        model_client = SimpleNamespace(chat=SimpleNamespace(completions=Completions()))
-        return ModelRuntime(
-            client=cast(Any, model_client),
-            model_name="tool-model",
-            is_local=False,
-        )
-
-    executed: list[tuple[str, dict[str, Any]]] = []
-
-    async def execute_tool(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
-        executed.append((name, arguments))
-        return {
-            "name": name,
-            "status": "completed",
-            "result_count": 10,
-            "duration_ms": 12,
-            "parameters": arguments,
-            "error_code": None,
-            "data": {"entries": [{"line": "hello"}]},
-        }
-
-    monkeypatch.setattr(client, "runtime", runtime)
-    result = await client.chat(
-        [{"role": "user", "content": "查询最近 10 条 Loki 日志"}],
-        {"scope": "overview"},
-        tools=[{"type": "function", "function": {"name": "query_loki_logs"}}],
-        tool_executor=execute_tool,
-    )
-
-    assert result.content == "找到 10 条 Loki 日志"
-    assert executed[0][0] == "query_loki_logs"
-    assert executed[0][1]["limit"] == 10
-    assert result.tool_calls[0]["result_count"] == 10
-    assert "data" not in result.tool_calls[0]
-    assert requests[1]["messages"][-1]["role"] == "tool"
+    assert result.value.query_packs == ["service_health"]
+    assert (result.input_tokens, result.output_tokens) == (9, 3)
+    assert captured["schema"] is QueryPackPlan
+    assert captured["options"] == {
+        "method": "json_mode",
+        "include_raw": True,
+        "max_tokens": 1000,
+    }
+    assert "HighLatency" in captured["messages"][1].content

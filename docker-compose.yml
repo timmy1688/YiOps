@@ -34,6 +34,48 @@ services:
     networks:
       - backend
 
+  yiops-mcp:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ${YIOPS_IMAGE:-yiops:local}
+    restart: unless-stopped
+    init: true
+    command: ["python", "-m", "app.mcp.server"]
+    depends_on:
+      mysql:
+        condition: service_healthy
+    environment:
+      YIOPS_ENVIRONMENT: production
+      YIOPS_DATABASE_URL: mysql://${MYSQL_USER:-yiops}:${MYSQL_PASSWORD:-yiops_local_password}@mysql:3306/${MYSQL_DATABASE:-yiops}?charset=utf8mb4
+      YIOPS_AUTO_CREATE_TABLES: "false"
+      YIOPS_DATASOURCE_MOCK_MODE: ${YIOPS_DATASOURCE_MOCK_MODE:-false}
+      YIOPS_DATASOURCE_TIMEOUT_SECONDS: ${YIOPS_DATASOURCE_TIMEOUT_SECONDS:-15}
+      YIOPS_MCP_INTERNAL_TOKEN: ${YIOPS_MCP_INTERNAL_TOKEN:-yiops-local-development-token}
+      YIOPS_MCP_HOST: 0.0.0.0
+      YIOPS_MCP_PORT: 8110
+      TZ: ${TZ:-UTC}
+    volumes:
+      - runtime_data:/app/.runtime
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8110/health', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 6
+      start_period: 20s
+    logging: *default-logging
+    networks:
+      - backend
+
   yiops:
     build:
       context: .
@@ -44,6 +86,8 @@ services:
     depends_on:
       mysql:
         condition: service_healthy
+      yiops-mcp:
+        condition: service_healthy
     environment:
       YIOPS_ENVIRONMENT: production
       YIOPS_DATABASE_URL: mysql://${MYSQL_USER:-yiops}:${MYSQL_PASSWORD:-yiops_local_password}@mysql:3306/${MYSQL_DATABASE:-yiops}?charset=utf8mb4
@@ -53,6 +97,8 @@ services:
       YIOPS_ANALYSIS_CONCURRENCY: ${YIOPS_ANALYSIS_CONCURRENCY:-2}
       YIOPS_ANALYSIS_TIMEOUT_SECONDS: ${YIOPS_ANALYSIS_TIMEOUT_SECONDS:-300}
       YIOPS_DATASOURCE_TIMEOUT_SECONDS: ${YIOPS_DATASOURCE_TIMEOUT_SECONDS:-15}
+      YIOPS_MCP_URL: http://yiops-mcp:8110/mcp
+      YIOPS_MCP_INTERNAL_TOKEN: ${YIOPS_MCP_INTERNAL_TOKEN:-yiops-local-development-token}
       YIOPS_AUTH_ENABLED: ${YIOPS_AUTH_ENABLED:-false}
       YIOPS_ADMIN_USERNAME: ${YIOPS_ADMIN_USERNAME:-admin}
       YIOPS_ADMIN_PASSWORD: ${YIOPS_ADMIN_PASSWORD:-}

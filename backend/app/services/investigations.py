@@ -4,10 +4,13 @@ from contextlib import suppress
 from datetime import UTC, datetime
 from typing import Any
 
+from app.agents.conversation import ConversationAgent
+from app.agents.tools import DatasourceToolExecutor
 from app.analysis.evidence import redact
-from app.connectors.client import DatasourceClient
-from app.llm.deepseek import DeepSeekClient
+from app.connectors.protocol import DatasourceGatewayProtocol
+from app.memory.wiki import WikiMemory
 from app.models import (
+    DatasourceConfig,
     EvidenceItem,
     Incident,
     Investigation,
@@ -21,7 +24,6 @@ from app.models import (
 )
 from app.runtime.events import EventBroker
 from app.security.tenant import set_tenant_id
-from app.services.chat import CHAT_TOOLS, ChatToolRunner
 
 TERMINAL_STATUSES = {"completed", "cancelled", "failed"}
 
@@ -31,13 +33,15 @@ class InvestigationRunner:
 
     def __init__(
         self,
-        datasource_client: DatasourceClient,
-        llm: DeepSeekClient,
+        datasource_gateway: DatasourceGatewayProtocol,
+        conversation_agent: ConversationAgent,
         events: EventBroker,
+        memory: WikiMemory,
     ) -> None:
-        self.datasource_client = datasource_client
-        self.llm = llm
+        self.datasource_gateway = datasource_gateway
+        self.conversation_agent = conversation_agent
         self.events = events
+        self.memory = memory
 
     async def run(self, investigation_id: str) -> None:
         investigation = await Investigation.get(id=investigation_id)
@@ -61,7 +65,28 @@ class InvestigationRunner:
         )
         messages.reverse()
         context = await self._context(investigation)
-        tool_runner = ChatToolRunner(self.datasource_client)
+        memory_query = " ".join(
+            [investigation.title, *[item.content for item in messages[-3:] if item.role == "user"]]
+        )
+        context["retrieved_memory"] = [
+            item.public_dict() for item in await self.memory.retrieve(memory_query)
+        ]
+        await self._event(
+            investigation_id,
+            "memory.retrieved",
+            {
+                "documents": [
+                    {
+                        key: item.get(key)
+                        for key in ("document_id", "title", "heading", "score", "version")
+                    }
+                    for item in context["retrieved_memory"]
+                    if isinstance(item, dict)
+                ]
+            },
+        )
+        agent_messages = [{"role": item.role, "content": item.content} for item in messages]
+        tool_runner = DatasourceToolExecutor(self.datasource_gateway, context)
 
         async def execute(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
             current = await Investigation.get(id=investigation_id)
@@ -125,10 +150,9 @@ class InvestigationRunner:
             return result
 
         try:
-            result = await self.llm.chat(
-                [{"role": item.role, "content": item.content} for item in messages],
+            result = await self.conversation_agent.run(
+                agent_messages,
                 context,
-                tools=CHAT_TOOLS,
                 tool_executor=execute,
             )
             await InvestigationMessage.create(
@@ -195,9 +219,22 @@ class InvestigationRunner:
 
     async def _context(self, investigation: Investigation) -> dict[str, object]:
         recent = await Incident.all().order_by("-started_at").limit(12)
+        datasources = await DatasourceConfig.filter(enabled=True).order_by("type", "name")
         context: dict[str, object] = {
             "scope": "investigation",
             "investigation": {"id": investigation.id, "title": investigation.title},
+            "available_datasources": [
+                {
+                    "name": item.name,
+                    "type": item.type,
+                    "settings": {
+                        key: value
+                        for key, value in item.settings.items()
+                        if key in {"cluster_id", "default_namespace", "index_alias", "tenant_id"}
+                    },
+                }
+                for item in datasources
+            ],
             "recent_incidents": [
                 {
                     "id": item.id,

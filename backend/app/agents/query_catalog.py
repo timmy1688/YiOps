@@ -203,12 +203,17 @@ QUERY_TEMPLATES: tuple[QueryTemplate, ...] = (
         id="application_error_logs",
         query_pack="application_errors",
         source="loki",
-        query=(
-            '{service="{service}", namespace=~"{namespace}"} '
-            '|~ "(?i)(error|exception|fatal)"'
-        ),
+        query=('{service="{service}", namespace=~"{namespace}"} |~ "(?i)(error|exception|fatal)"'),
         kind="log",
         title="Application error logs",
+    ),
+    QueryTemplate(
+        id="application_error_traces",
+        query_pack="application_errors",
+        source="tempo",
+        query='{ resource.service.name = "{service}" && status = error }',
+        kind="trace",
+        title="Application error traces",
     ),
     QueryTemplate(
         id="application_error_events",

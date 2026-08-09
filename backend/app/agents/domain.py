@@ -2,7 +2,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Literal
 
-SourceType = Literal["prometheus", "loki", "elasticsearch", "kubernetes"]
+SourceType = Literal["prometheus", "loki", "tempo", "elasticsearch", "kubernetes"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -11,7 +11,7 @@ class QueryTemplate:
     query_pack: str
     source: SourceType
     query: str
-    kind: Literal["metric", "log", "object"]
+    kind: Literal["metric", "log", "trace", "object"]
     title: str
 
 

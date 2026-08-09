@@ -7,6 +7,7 @@ import {
   DataAnalysis,
   DataLine,
   Monitor,
+  Reading,
   Lock,
   Setting,
   SetUp,
@@ -30,6 +31,7 @@ const activeMenu = computed(() => {
   if (route.path.startsWith('/chat')) return '/chat'
   if (route.path.startsWith('/investigations')) return '/investigations'
   if (route.path.startsWith('/evaluations')) return '/evaluations'
+  if (route.path.startsWith('/wiki')) return '/wiki'
   if (route.path.startsWith('/datasources')) return '/datasources'
   if (route.path.startsWith('/integrations')) return '/integrations'
   if (route.path.startsWith('/model-config')) return '/model-config'
@@ -39,6 +41,7 @@ const pageTitle = computed(() => {
   if (route.path.startsWith('/chat')) return 'AI 运维助手'
   if (route.path.startsWith('/investigations')) return '根因调查工作台'
   if (route.path.startsWith('/evaluations')) return 'RCA 评测中心'
+  if (route.path.startsWith('/wiki')) return 'Wiki 记忆库'
   if (route.path.startsWith('/datasources')) return '数据源管理'
   if (route.path.startsWith('/integrations')) return '告警接入'
   if (route.path.startsWith('/model-config')) return '模型配置'
@@ -102,6 +105,10 @@ async function submitPasswordChange() {
         <el-menu-item index="/evaluations">
           <el-icon><DataLine /></el-icon>
           <span>RCA 评测</span>
+        </el-menu-item>
+        <el-menu-item index="/wiki">
+          <el-icon><Reading /></el-icon>
+          <span>Wiki 记忆</span>
         </el-menu-item>
         <el-sub-menu index="system-settings">
           <template #title>

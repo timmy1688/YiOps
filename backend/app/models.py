@@ -93,8 +93,8 @@ class AlertIntegration(TimestampModel):
 class AnalysisModelConfig(TimestampModel):
     id = fields.CharField(max_length=40, primary_key=True)
     tenant = fields.ForeignKeyField("models.Tenant", related_name="model_configs")
-    name = fields.CharField(max_length=120, default="DeepSeek")
-    provider = fields.CharField(max_length=32, default="deepseek")
+    name = fields.CharField(max_length=120, default="OpenAI Compatible")
+    provider = fields.CharField(max_length=32, default="openai_compatible")
     base_url = fields.CharField(max_length=500)
     model_name = fields.CharField(max_length=120)
     secret_ref = fields.TextField(null=True)
@@ -346,6 +346,73 @@ class InvestigationEvent(Model):
     class Meta:
         table = "investigation_events"
         indexes = (("investigation_id", "created_at"),)
+
+
+class ChatConversation(TimestampModel):
+    id = fields.CharField(max_length=40, primary_key=True)
+    tenant = fields.ForeignKeyField("models.Tenant", related_name="chat_conversations")
+    incident = fields.ForeignKeyField(
+        "models.Incident",
+        related_name="chat_conversations",
+        null=True,
+    )
+    title = fields.CharField(max_length=300, default="新对话")
+    last_message_at = fields.DatetimeField(null=True)
+
+    class Meta:
+        table = "chat_conversations"
+        indexes = (("tenant_id", "updated_at"), ("incident_id", "updated_at"))
+
+
+class ChatConversationMessage(Model):
+    id = fields.CharField(max_length=40, primary_key=True)
+    conversation = fields.ForeignKeyField(
+        "models.ChatConversation",
+        related_name="messages",
+    )
+    role = fields.CharField(max_length=24)
+    content = fields.TextField()
+    model_name = fields.CharField(max_length=120, null=True)
+    tool_calls = fields.JSONField(default=list)
+    created_at = fields.DatetimeField(auto_now_add=True)
+
+    class Meta:
+        table = "chat_conversation_messages"
+        indexes = (("conversation_id", "created_at"),)
+
+
+class WikiDocument(TimestampModel):
+    id = fields.CharField(max_length=40, primary_key=True)
+    tenant = fields.ForeignKeyField("models.Tenant", related_name="wiki_documents")
+    title = fields.CharField(max_length=300)
+    content = fields.TextField()
+    tags = fields.JSONField(default=list)
+    status = fields.CharField(max_length=24, default="published", db_index=True)
+    version = fields.IntField(default=1)
+    chunk_count = fields.IntField(default=0)
+
+    class Meta:
+        table = "wiki_documents"
+        unique_together = (("tenant_id", "title"),)
+        indexes = (("tenant_id", "status", "updated_at"),)
+
+
+class WikiChunk(Model):
+    id = fields.CharField(max_length=48, primary_key=True)
+    tenant = fields.ForeignKeyField("models.Tenant", related_name="wiki_chunks")
+    document = fields.ForeignKeyField("models.WikiDocument", related_name="chunks")
+    ordinal = fields.IntField()
+    heading = fields.CharField(max_length=500, null=True)
+    content = fields.TextField()
+    token_count = fields.IntField(default=0)
+    embedding = fields.JSONField(default=list)
+    keywords = fields.JSONField(default=list)
+    created_at = fields.DatetimeField(auto_now_add=True)
+
+    class Meta:
+        table = "wiki_chunks"
+        unique_together = (("document_id", "ordinal"),)
+        indexes = (("tenant_id", "document_id"),)
 
 
 class EvaluationRun(Model):

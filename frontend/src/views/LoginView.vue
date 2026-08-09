@@ -34,7 +34,7 @@ async function submit() {
       <div>
         <p class="eyebrow">EVIDENCE-DRIVEN RCA</p>
         <h1>让每一个根因结论，<br />都能回到真实证据。</h1>
-        <p>跨 Loki、Prometheus 与 Kubernetes 持续取证，形成可追溯、可复核的故障调查。</p>
+        <p>跨 Loki、Prometheus、Tempo 与 Kubernetes 持续取证，形成可追溯、可复核的故障调查。</p>
       </div>
       <div class="login-points">
         <span>只读工具边界</span><span>多源证据链</span><span>完整审计轨迹</span>

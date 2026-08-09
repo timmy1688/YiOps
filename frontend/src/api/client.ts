@@ -98,8 +98,10 @@ export interface ToolExecution {
 export interface Datasource {
   id: string
   name: string
-  type: 'prometheus' | 'loki' | 'elasticsearch' | 'kubernetes'
+  type: 'prometheus' | 'loki' | 'tempo' | 'elasticsearch' | 'kubernetes'
   base_url: string
+  auth_type: 'none' | 'bearer' | 'basic' | 'api_key'
+  username: string | null
   secret_configured: boolean
   settings: Record<string, unknown>
   enabled: boolean
@@ -111,10 +113,10 @@ export interface DatasourceInput {
   name: string
   type: Datasource['type']
   base_url?: string
-  kubeconfig?: string
+  auth_type: Datasource['auth_type']
+  username?: string
   enabled: boolean
   credential?: string
-  ca_cert?: string
   settings?: Record<string, unknown>
 }
 
@@ -124,6 +126,27 @@ export interface ConnectorType {
   health_path: string
   capabilities: string[]
   credential_kind: string
+}
+
+export interface WikiDocument {
+  id: string
+  title: string
+  content: string
+  tags: string[]
+  status: 'draft' | 'published'
+  version: number
+  chunk_count: number
+  created_at: string
+  updated_at: string
+}
+
+export interface WikiSearchResult {
+  document_id: string
+  title: string
+  heading: string | null
+  excerpt: string
+  score: number
+  version: number
 }
 
 export interface AlertIntegration {
@@ -183,6 +206,8 @@ export interface ChatCompletionResponse {
   model_name: string
   context_scope: 'overview' | 'incident'
   tool_calls: ChatToolCall[]
+  conversation_id?: string
+  conversation_title?: string
 }
 
 export interface ChatToolCall {
@@ -192,6 +217,29 @@ export interface ChatToolCall {
   duration_ms: number
   parameters: Record<string, unknown>
   error_code: string | null
+}
+
+export interface ChatConversationMessage {
+  id: string
+  role: 'user' | 'assistant'
+  content: string
+  model_name: string | null
+  tool_calls: ChatToolCall[]
+  created_at: string
+}
+
+export interface ChatConversation {
+  id: string
+  title: string
+  incident_id: string | null
+  message_count: number
+  last_message_at: string | null
+  created_at: string
+  updated_at: string
+}
+
+export interface ChatConversationDetail extends ChatConversation {
+  messages: ChatConversationMessage[]
 }
 
 export interface InvestigationMessage {
@@ -369,6 +417,10 @@ export const listConnectorTypes = async () =>
   (await api.get<ConnectorType[]>('/connector-types')).data
 export const createDatasource = async (payload: DatasourceInput) =>
   (await api.post<Datasource>('/datasources', payload)).data
+export const updateDatasource = async (
+  id: string,
+  payload: Partial<DatasourceInput>,
+) => (await api.patch<Datasource>(`/datasources/${id}`, payload)).data
 export const testDatasource = async (id: string) =>
   (await api.post<{ ok: boolean; message: string }>(`/datasources/${id}/test`)).data
 export const deleteDatasource = async (id: string) => {
@@ -400,6 +452,94 @@ export const testModelConfig = async (id: string) =>
   (await api.post<{ ok: boolean; message: string }>(`/model-configs/${id}/test`)).data
 export const createChatCompletion = async (payload: ChatCompletionInput) =>
   (await api.post<ChatCompletionResponse>('/chat/completions', payload, { timeout: 70_000 })).data
+export const listChatConversations = async () =>
+  (await api.get<ChatConversation[]>('/chat/conversations')).data
+export const createChatConversation = async (payload: {
+  title?: string
+  incident_id?: string
+}) => (await api.post<ChatConversationDetail>('/chat/conversations', payload)).data
+export const importChatConversation = async (payload: {
+  title?: string
+  incident_id?: string
+  messages: Array<{ role: 'user' | 'assistant'; content: string }>
+}) => (await api.post<ChatConversationDetail>('/chat/conversations/import', payload)).data
+export const getChatConversation = async (id: string) =>
+  (await api.get<ChatConversationDetail>(`/chat/conversations/${id}`)).data
+export const updateChatConversation = async (id: string, title: string) =>
+  (await api.patch<ChatConversation>(`/chat/conversations/${id}`, { title })).data
+export const deleteChatConversation = async (id: string) => {
+  await api.delete(`/chat/conversations/${id}`)
+}
+export const sendChatConversationMessage = async (id: string, content: string) =>
+  (
+    await api.post<ChatCompletionResponse>(
+      `/chat/conversations/${id}/messages`,
+      { content },
+      { timeout: 70_000 },
+    )
+  ).data
+export const streamChatConversationMessage = async (
+  id: string,
+  content: string,
+  handlers: {
+    onToken: (content: string) => void
+    onDone: (response: ChatCompletionResponse) => void
+  },
+  signal?: AbortSignal,
+) => {
+  const csrf = cookie('yiops_csrf')
+  const response = await fetch(
+    `/api/v1/chat/conversations/${encodeURIComponent(id)}/messages/stream`,
+    {
+      method: 'POST',
+      credentials: 'include',
+      signal,
+      headers: {
+        'Content-Type': 'application/json',
+        ...(csrf ? { 'X-YiOps-CSRF': csrf } : {}),
+      },
+      body: JSON.stringify({ content }),
+    },
+  )
+  if (!response.ok || !response.body) {
+    let message = `流式请求失败（${response.status}）`
+    try {
+      const payload = await response.json() as { detail?: string }
+      message = payload.detail || message
+    } catch {
+      // Keep the HTTP status fallback.
+    }
+    throw new Error(message)
+  }
+  const reader = response.body.getReader()
+  const decoder = new TextDecoder()
+  let buffer = ''
+  const consume = (block: string) => {
+    let event = 'message'
+    const data: string[] = []
+    for (const line of block.split('\n')) {
+      if (line.startsWith('event:')) event = line.slice(6).trim()
+      if (line.startsWith('data:')) data.push(line.slice(5).trimStart())
+    }
+    if (!data.length || event === 'ping' || event === 'conversation') return
+    const payload = JSON.parse(data.join('\n')) as Record<string, unknown>
+    if (event === 'token') handlers.onToken(String(payload.content || ''))
+    else if (event === 'done') handlers.onDone(payload as unknown as ChatCompletionResponse)
+    else if (event === 'error') throw new Error(String(payload.message || '流式生成失败'))
+  }
+  while (true) {
+    const { value, done } = await reader.read()
+    buffer += decoder.decode(value, { stream: !done }).replace(/\r\n/g, '\n')
+    let boundary = buffer.indexOf('\n\n')
+    while (boundary >= 0) {
+      consume(buffer.slice(0, boundary))
+      buffer = buffer.slice(boundary + 2)
+      boundary = buffer.indexOf('\n\n')
+    }
+    if (done) break
+  }
+  if (buffer.trim()) consume(buffer)
+}
 export const listInvestigations = async () =>
   (await api.get<Investigation[]>('/investigations')).data
 export const createInvestigation = async (payload: {
@@ -420,7 +560,25 @@ export const shareInvestigation = async (id: string) =>
     await api.post<{ share_token: string; share_path: string }>(
       `/investigations/${id}/share`,
     )
-  ).data
+    ).data
+
+export const listWikiDocuments = async () =>
+  (await api.get<WikiDocument[]>('/wiki')).data
+export const createWikiDocument = async (payload: {
+  title: string
+  content: string
+  tags: string[]
+  status: 'draft' | 'published'
+}) => (await api.post<WikiDocument>('/wiki', payload)).data
+export const updateWikiDocument = async (
+  id: string,
+  payload: Partial<Pick<WikiDocument, 'title' | 'content' | 'tags' | 'status'>>,
+) => (await api.patch<WikiDocument>(`/wiki/${id}`, payload)).data
+export const deleteWikiDocument = async (id: string) => api.delete(`/wiki/${id}`)
+export const reindexWikiDocument = async (id: string) =>
+  (await api.post<WikiDocument>(`/wiki/${id}/reindex`)).data
+export const searchWiki = async (query: string, limit = 6) =>
+  (await api.post<WikiSearchResult[]>('/wiki/search/query', { query, limit })).data
 export const investigationEventUrl = (id: string) =>
   `${window.location.origin}/api/v1/investigations/${id}/events`
 export const investigationExportUrl = (id: string) =>

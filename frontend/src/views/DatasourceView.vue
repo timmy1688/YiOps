@@ -1,7 +1,7 @@
 <script setup lang="ts">
-import { Connection, Delete as DeleteIcon, Plus, UploadFilled } from '@element-plus/icons-vue'
-import { ElMessage, ElMessageBox, type UploadFile } from 'element-plus'
-import { onMounted, reactive, ref, watch } from 'vue'
+import { Connection, Delete as DeleteIcon, EditPen, Plus } from '@element-plus/icons-vue'
+import { ElMessage, ElMessageBox } from 'element-plus'
+import { nextTick, onMounted, reactive, ref, watch } from 'vue'
 
 import {
   createDatasource,
@@ -9,47 +9,59 @@ import {
   listConnectorTypes,
   listDatasources,
   testDatasource,
+  updateDatasource,
   type ConnectorType,
   type Datasource,
   type DatasourceInput,
 } from '@/api/client'
 
 const dialogVisible = ref(false)
+const editingId = ref('')
 const submitting = ref(false)
 const testingId = ref('')
 const deletingId = ref('')
 const loading = ref(false)
 const datasources = ref<Datasource[]>([])
 const connectorTypes = ref<ConnectorType[]>([])
-const kubeconfigFilename = ref('')
 const form = reactive<
   DatasourceInput & {
     cluster_id: string
     default_namespace: string
+    tenant_id: string
+    index_alias: string
     verify_ssl: boolean
-    kubeconfig: string
   }
 >({
   name: '',
   type: 'prometheus',
-  base_url: 'http://',
+  base_url: 'http://prometheus:9090',
+  auth_type: 'none',
+  username: '',
   enabled: true,
   credential: '',
-  ca_cert: '',
   cluster_id: '',
   default_namespace: '',
+  tenant_id: '',
+  index_alias: 'logs-*',
   verify_ssl: true,
-  kubeconfig: '',
 })
+
+const nativeEndpoints: Record<Datasource['type'], string> = {
+  prometheus: 'http://prometheus:9090',
+  loki: 'http://loki:3100',
+  tempo: 'http://tempo:3200',
+  elasticsearch: 'http://elasticsearch:9200',
+  kubernetes: 'https://kubernetes.default.svc',
+}
+
+function defaultEndpoint() {
+  return nativeEndpoints[form.type]
+}
 
 watch(
   () => form.type,
-  (type) => {
-    form.base_url = type === 'kubernetes' ? '' : 'http://'
-    if (type !== 'kubernetes') {
-      form.kubeconfig = ''
-      kubeconfigFilename.value = ''
-    }
+  () => {
+    form.base_url = defaultEndpoint()
   },
 )
 
@@ -76,30 +88,48 @@ async function submit() {
     ElMessage.warning('请填写数据源名称')
     return
   }
-  if (form.type === 'kubernetes' && !form.kubeconfig.trim()) {
-    ElMessage.warning('请选择 kubeconfig 文件')
+  if (!form.base_url?.replace(/^https?:\/\//, '').trim()) {
+    ElMessage.warning('请填写数据源地址')
     return
   }
-  if (
-    form.type !== 'kubernetes' &&
-    !form.base_url?.replace(/^https?:\/\//, '').trim()
-  ) {
-    ElMessage.warning('请填写数据源地址')
+  if (form.type === 'kubernetes' && !form.cluster_id.trim()) {
+    ElMessage.warning('请填写 Kubernetes 集群标识')
     return
   }
   submitting.value = true
   try {
-    await createDatasource({
+    const payload: DatasourceInput = {
       name: form.name.trim(),
       type: form.type,
-      base_url: form.type === 'kubernetes' ? undefined : form.base_url?.trim(),
-      kubeconfig: form.type === 'kubernetes' ? form.kubeconfig : undefined,
+      base_url: form.base_url?.trim(),
+      auth_type: form.auth_type,
+      username: form.auth_type === 'basic' ? form.username?.trim() : undefined,
+      credential: form.credential?.trim() || undefined,
       enabled: form.enabled,
-      settings: {},
-    })
+      settings: {
+        ...(['prometheus', 'loki', 'tempo'].includes(form.type) && form.tenant_id.trim()
+          ? { tenant_id: form.tenant_id.trim() }
+          : {}),
+        ...(form.type === 'elasticsearch'
+          ? { index_alias: form.index_alias.trim() || 'logs-*' }
+          : {}),
+        ...(form.type === 'kubernetes'
+          ? {
+              cluster_id: form.cluster_id.trim(),
+              default_namespace: form.default_namespace.trim(),
+              verify_ssl: form.verify_ssl,
+            }
+          : {}),
+      },
+    }
+    if (editingId.value) {
+      await updateDatasource(editingId.value, payload)
+    } else {
+      await createDatasource(payload)
+    }
     dialogVisible.value = false
     await loadDatasources()
-    ElMessage.success('数据源已添加')
+    ElMessage.success(editingId.value ? '数据源已更新' : '数据源已添加')
   } catch (error) {
     const detail = (error as { response?: { data?: { detail?: string } } }).response?.data
       ?.detail
@@ -109,30 +139,42 @@ async function submit() {
   }
 }
 
-async function selectKubeconfig(file: UploadFile) {
-  if (!file.raw) return
-  if (file.raw.size > 1_000_000) {
-    ElMessage.error('kubeconfig 文件不能超过 1 MB')
-    return
-  }
-  form.kubeconfig = await file.raw.text()
-  kubeconfigFilename.value = file.name
-}
-
 function openCreate() {
+  editingId.value = ''
   Object.assign(form, {
     name: '',
     type: 'prometheus',
-    base_url: 'http://',
+    base_url: nativeEndpoints.prometheus,
+    auth_type: 'none',
+    username: '',
     enabled: true,
     credential: '',
-    ca_cert: '',
     cluster_id: '',
     default_namespace: '',
+    tenant_id: '',
+    index_alias: 'logs-*',
     verify_ssl: true,
-    kubeconfig: '',
   })
-  kubeconfigFilename.value = ''
+  dialogVisible.value = true
+}
+
+async function openEdit(item: Datasource) {
+  editingId.value = item.id
+  Object.assign(form, {
+    name: item.name,
+    type: item.type,
+    enabled: item.enabled,
+    auth_type: item.auth_type,
+    username: item.username || '',
+    credential: '',
+    cluster_id: String(item.settings.cluster_id || ''),
+    default_namespace: String(item.settings.default_namespace || ''),
+    tenant_id: String(item.settings.tenant_id || ''),
+    index_alias: String(item.settings.index_alias || 'logs-*'),
+    verify_ssl: item.settings.verify_ssl !== false,
+  })
+  await nextTick()
+  form.base_url = item.base_url
   dialogVisible.value = true
 }
 
@@ -210,9 +252,13 @@ async function remove(item: Datasource) {
             <template v-if="item.type === 'kubernetes'">
               · {{ item.settings.cluster_id }}
             </template>
+            <template v-if="item.type === 'tempo' && item.settings.tenant_id">
+              · tenant {{ item.settings.tenant_id }}
+            </template>
           </span>
           <code>{{ item.base_url }}</code>
           <small>凭据：{{ item.secret_configured ? '已配置' : '未配置' }}</small>
+          <small>MCP：外部只读服务</small>
         </div>
         <div class="datasource-actions">
           <el-button
@@ -221,6 +267,9 @@ async function remove(item: Datasource) {
             @click="test(item)"
           >
             测试连接
+          </el-button>
+          <el-button plain :icon="EditPen" @click="openEdit(item)">
+            编辑
           </el-button>
           <el-button
             plain
@@ -239,12 +288,16 @@ async function remove(item: Datasource) {
       />
     </div>
 
-    <el-drawer v-model="dialogVisible" title="添加数据源" size="480px">
-      <p class="drawer-intro">数据源仅用于受控的只读查询，不会向模型暴露凭据。</p>
+    <el-drawer
+      v-model="dialogVisible"
+      :title="editingId ? '更新数据源' : '添加数据源'"
+      size="480px"
+    >
+      <p class="drawer-intro">填写原生数据源 API 地址；查询统一由内部 yiops-mcp 以只读方式执行。</p>
       <el-form label-position="top">
         <el-form-item label="名称"><el-input v-model="form.name" /></el-form-item>
         <el-form-item label="类型">
-          <el-select v-model="form.type">
+          <el-select v-model="form.type" :disabled="Boolean(editingId)">
             <el-option
               v-for="connector in connectorTypes"
               :key="connector.type"
@@ -253,41 +306,60 @@ async function remove(item: Datasource) {
             />
           </el-select>
         </el-form-item>
-        <el-form-item v-if="form.type !== 'kubernetes'" label="地址">
-          <el-input v-model="form.base_url" placeholder="例如：http://prometheus:9090" />
+        <el-form-item label="原生 API 地址">
+          <el-input
+            v-model="form.base_url"
+            :placeholder="defaultEndpoint()"
+          />
         </el-form-item>
-        <template v-if="form.type === 'kubernetes'">
-          <el-form-item label="kubeconfig 文件">
-            <el-upload
-              class="kubeconfig-upload"
-              drag
-              accept=".yaml,.yml,.conf"
-              :auto-upload="false"
-              :on-change="selectKubeconfig"
-              :show-file-list="false"
-            >
-              <el-icon class="el-icon--upload"><UploadFilled /></el-icon>
-              <div class="el-upload__text">
-                拖入 kubeconfig，或<em>点击选择</em>
-              </div>
-              <template #tip>
-                <div class="el-upload__tip">
-                  自动读取当前 context、API Server 和凭据，最大 1 MB
-                </div>
-              </template>
-            </el-upload>
-            <div v-if="kubeconfigFilename" class="selected-kubeconfig">
-              <Connection />
-              <span>{{ kubeconfigFilename }}</span>
-              <b>已读取</b>
-            </div>
+        <template v-if="['prometheus', 'loki', 'tempo'].includes(form.type)">
+          <el-form-item label="租户 ID（可选）">
+            <el-input v-model="form.tenant_id" placeholder="作为 X-Scope-OrgID 发送" />
           </el-form-item>
         </template>
+        <el-form-item v-if="form.type === 'elasticsearch'" label="索引模式">
+          <el-input v-model="form.index_alias" placeholder="logs-*" />
+        </el-form-item>
+        <template v-if="form.type === 'kubernetes'">
+          <el-form-item label="集群标识">
+            <el-input v-model="form.cluster_id" placeholder="例如：prod-cn" />
+          </el-form-item>
+          <el-form-item label="默认 Namespace（可选）">
+            <el-input v-model="form.default_namespace" placeholder="留空表示全局" />
+          </el-form-item>
+          <el-form-item label="校验 TLS 证书">
+            <el-switch v-model="form.verify_ssl" />
+          </el-form-item>
+        </template>
+        <el-form-item label="认证方式">
+          <el-select v-model="form.auth_type">
+            <el-option label="无认证" value="none" />
+            <el-option label="Bearer Token" value="bearer" />
+            <el-option label="Basic Auth" value="basic" />
+            <el-option label="API Key" value="api_key" />
+          </el-select>
+        </el-form-item>
+        <el-form-item v-if="form.auth_type === 'basic'" label="用户名">
+          <el-input v-model="form.username" autocomplete="username" />
+        </el-form-item>
+        <el-form-item
+          v-if="form.auth_type !== 'none'"
+          :label="editingId ? '凭据（留空则保持不变）' : form.auth_type === 'basic' ? '密码' : '凭据'"
+        >
+          <el-input
+            v-model="form.credential"
+            type="password"
+            show-password
+            autocomplete="new-password"
+          />
+        </el-form-item>
         <el-form-item><el-switch v-model="form.enabled" />&nbsp;启用</el-form-item>
       </el-form>
       <template #footer>
         <el-button @click="dialogVisible = false">取消</el-button>
-        <el-button type="primary" :loading="submitting" @click="submit">保存</el-button>
+        <el-button type="primary" :loading="submitting" @click="submit">
+          {{ editingId ? '更新' : '保存' }}
+        </el-button>
       </template>
     </el-drawer>
   </section>

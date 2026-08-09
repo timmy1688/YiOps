@@ -38,7 +38,7 @@ registry.register(
         type="prometheus",
         display_name="Prometheus",
         health_path="/-/healthy",
-        capabilities=("metrics", "range_query", "query_pack"),
+        capabilities=("read_only", "metrics", "range_query", "query_pack"),
     )
 )
 registry.register(
@@ -46,7 +46,21 @@ registry.register(
         type="loki",
         display_name="Loki",
         health_path="/ready",
-        capabilities=("logs", "range_query", "query_pack"),
+        capabilities=("read_only", "logs", "range_query", "query_pack"),
+    )
+)
+registry.register(
+    ConnectorSpec(
+        type="tempo",
+        display_name="Tempo",
+        health_path="/ready",
+        capabilities=(
+            "read_only",
+            "traces",
+            "traceql_search",
+            "trace_by_id",
+            "query_pack",
+        ),
     )
 )
 registry.register(
@@ -54,7 +68,7 @@ registry.register(
         type="elasticsearch",
         display_name="Elasticsearch",
         health_path="/",
-        capabilities=("logs", "search", "query_pack"),
+        capabilities=("read_only", "logs", "search", "query_pack"),
     )
 )
 registry.register(
@@ -62,7 +76,7 @@ registry.register(
         type="kubernetes",
         display_name="Kubernetes",
         health_path="/version",
-        capabilities=("objects", "events", "workloads", "query_pack"),
-        credential_kind="service_account",
+        capabilities=("read_only", "objects", "events", "workloads", "query_pack"),
+        credential_kind="bearer",
     )
 )

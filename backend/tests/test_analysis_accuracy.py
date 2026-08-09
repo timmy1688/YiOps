@@ -2,14 +2,16 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from app.agents.graph import (
+from app.agents.domain import QueryTemplate, ToolResult
+from app.agents.rca import (
     _calibrate_confidence,
     _collection_summary,
     _evidence_relevance,
     _investigation_window,
 )
+from app.analysis.evidence import build_evidence
 from app.config import Settings
-from app.connectors.client import DatasourceClient
+from app.connectors.datasources import DatasourceGateway
 from app.models import DatasourceConfig
 from app.schemas import Hypothesis, InvestigationRefinement, RootCauseOutput
 
@@ -113,6 +115,47 @@ async def test_missing_optional_datasource_returns_none(
         lambda **_filters: EmptyQuery(),
     )
 
-    client = DatasourceClient(Settings())
+    client = DatasourceGateway(Settings())
 
     assert await client._get_datasource("elasticsearch") is None
+
+
+def test_tempo_trace_result_builds_distributed_trace_evidence() -> None:
+    template = QueryTemplate(
+        id="application_error_traces",
+        query_pack="application_errors",
+        source="tempo",
+        query='{ resource.service.name = "{service}" && status = error }',
+        kind="trace",
+        title="Application error traces",
+    )
+    result = ToolResult(
+        source="tempo",
+        query_pack="application_errors",
+        template_id=template.id,
+        status="completed",
+        result_count=1,
+        data={
+            "traces": [
+                {
+                    "trace_id": "0123456789abcdef0123456789abcdef",
+                    "root_service_name": "checkout",
+                    "root_trace_name": "POST /checkout",
+                    "start_time": "2026-08-08T10:00:00+00:00",
+                    "duration_ms": 3200,
+                }
+            ]
+        },
+    )
+
+    evidence = build_evidence(
+        result,
+        template,
+        service="checkout",
+        tool_execution_id="tool-1",
+    )
+
+    assert evidence is not None
+    assert evidence.type == "distributed_trace"
+    assert evidence.source == "tempo"
+    assert "0123456789abcdef" in evidence.summary

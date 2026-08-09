@@ -1,6 +1,7 @@
 import hashlib
 import json
 import re
+from collections.abc import Mapping
 from datetime import datetime
 
 from app.agents.domain import EvidenceRecord, QueryTemplate, ToolResult
@@ -32,6 +33,8 @@ def build_evidence(
         return _metric_evidence(result, template, service, tool_execution_id)
     if template.kind == "object":
         return _object_evidence(result, template, service, tool_execution_id)
+    if template.kind == "trace":
+        return _trace_evidence(result, template, service, tool_execution_id)
     return _log_evidence(result, template, service, tool_execution_id)
 
 
@@ -157,7 +160,50 @@ def _object_evidence(
     )
 
 
-def _hash_payload(payload: dict[str, object]) -> str:
+def _trace_evidence(
+    result: ToolResult,
+    template: QueryTemplate,
+    service: str,
+    tool_execution_id: str,
+) -> EvidenceRecord:
+    raw_traces = result.data.get("traces", [])
+    traces = raw_traces[:20] if isinstance(raw_traces, list) else []
+    summaries = [
+        (
+            f"{trace.get('root_service_name') or '-'} / "
+            f"{trace.get('root_trace_name') or '-'} / "
+            f"{trace.get('duration_ms') or 0}ms / trace={trace.get('trace_id') or '-'}"
+        )
+        for trace in traces[:5]
+        if isinstance(trace, dict)
+    ]
+    summary = f"{template.title}: {result.result_count} matching traces"
+    if summaries:
+        summary += "; " + "; ".join(summaries)
+    payload = {
+        "template": template.id,
+        "service": service,
+        "traces": traces,
+    }
+    observed_at = result.data.get("observed_at")
+    if not observed_at and traces and isinstance(traces[0], dict):
+        observed_at = traces[0].get("start_time")
+    return EvidenceRecord(
+        id=new_id("trace"),
+        type="distributed_trace",
+        source=result.source,
+        title=template.title,
+        summary=redact(summary)[:4000],
+        observed_at=_parse_datetime(observed_at),
+        subject={"service": service},
+        values={"count": result.result_count, "traces": traces},
+        quality=0.95,
+        content_hash=_hash_payload(payload),
+        tool_execution_id=tool_execution_id,
+    )
+
+
+def _hash_payload(payload: Mapping[str, object]) -> str:
     encoded = json.dumps(payload, sort_keys=True, ensure_ascii=False).encode()
     return hashlib.sha256(encoded).hexdigest()
 

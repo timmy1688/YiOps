@@ -46,14 +46,20 @@ def test_builtin_benchmark_is_complete_and_grounded() -> None:
     assert len(report["results"]) == 20
     assert report["aggregate"]["root_cause_top1"] >= 0.9
     assert report["aggregate"]["unsupported_claim_rate"] == 0
-    assert {"configuration", "database", "kubernetes", "resource"}.issubset(
-        report["categories"]
-    )
+    assert {"configuration", "database", "kubernetes", "resource"}.issubset(report["categories"])
 
 
 def test_connector_registry_exposes_all_builtin_capabilities() -> None:
     connectors = {item.type: item for item in registry.all()}
 
-    assert set(connectors) == {"prometheus", "loki", "elasticsearch", "kubernetes"}
+    assert set(connectors) == {
+        "prometheus",
+        "loki",
+        "tempo",
+        "elasticsearch",
+        "kubernetes",
+    }
     assert "logs" in connectors["loki"].capabilities
-    assert connectors["kubernetes"].credential_kind == "service_account"
+    assert "traceql_search" in connectors["tempo"].capabilities
+    assert "read_only" in connectors["kubernetes"].capabilities
+    assert connectors["kubernetes"].credential_kind == "bearer"

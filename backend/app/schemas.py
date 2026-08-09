@@ -1,7 +1,7 @@
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, HttpUrl
+from pydantic import BaseModel, ConfigDict, Field, HttpUrl, model_validator
 
 
 class APIModel(BaseModel):
@@ -46,12 +46,11 @@ class EvaluationRunRead(APIModel):
 
 class DatasourceCreate(APIModel):
     name: str = Field(min_length=1, max_length=120)
-    type: Literal["prometheus", "loki", "elasticsearch", "kubernetes"]
+    type: Literal["prometheus", "loki", "tempo", "elasticsearch", "kubernetes"]
     base_url: HttpUrl | None = None
-    kubeconfig: str | None = Field(default=None, max_length=1_000_000)
-    secret_ref: str | None = None
+    auth_type: Literal["none", "bearer", "basic", "api_key"] = "none"
+    username: str | None = Field(default=None, max_length=255)
     credential: str | None = None
-    ca_cert: str | None = None
     settings: dict[str, Any] = Field(default_factory=dict)
     enabled: bool = True
 
@@ -59,10 +58,9 @@ class DatasourceCreate(APIModel):
 class DatasourceUpdate(APIModel):
     name: str | None = Field(default=None, min_length=1, max_length=120)
     base_url: HttpUrl | None = None
-    kubeconfig: str | None = Field(default=None, max_length=1_000_000)
-    secret_ref: str | None = None
+    auth_type: Literal["none", "bearer", "basic", "api_key"] | None = None
+    username: str | None = Field(default=None, max_length=255)
     credential: str | None = None
-    ca_cert: str | None = None
     settings: dict[str, Any] | None = None
     enabled: bool | None = None
 
@@ -72,6 +70,8 @@ class DatasourceRead(APIModel):
     name: str
     type: str
     base_url: str
+    auth_type: str
+    username: str | None
     secret_configured: bool
     settings: dict[str, Any]
     enabled: bool
@@ -268,6 +268,48 @@ class ChatResponse(APIModel):
     model_name: str
     context_scope: str
     tool_calls: list[ChatToolCallRead] = Field(default_factory=list)
+    conversation_id: str | None = None
+    conversation_title: str | None = None
+
+
+class ChatConversationCreate(APIModel):
+    title: str | None = Field(default=None, max_length=300)
+    incident_id: str | None = Field(default=None, max_length=40)
+
+
+class ChatConversationImport(ChatConversationCreate):
+    messages: list[ChatMessage] = Field(min_length=1, max_length=24)
+
+
+class ChatConversationUpdate(APIModel):
+    title: str = Field(min_length=1, max_length=300)
+
+
+class ChatConversationMessageCreate(APIModel):
+    content: str = Field(min_length=1, max_length=8000)
+
+
+class ChatConversationMessageRead(APIModel):
+    id: str
+    role: Literal["user", "assistant"]
+    content: str
+    model_name: str | None
+    tool_calls: list[ChatToolCallRead] = Field(default_factory=list)
+    created_at: datetime
+
+
+class ChatConversationRead(APIModel):
+    id: str
+    title: str
+    incident_id: str | None
+    message_count: int
+    last_message_at: datetime | None
+    created_at: datetime
+    updated_at: datetime
+
+
+class ChatConversationDetail(ChatConversationRead):
+    messages: list[ChatConversationMessageRead] = Field(default_factory=list)
 
 
 class InvestigationCreate(APIModel):
@@ -362,6 +404,46 @@ class InvestigationShareRead(APIModel):
     share_path: str
 
 
+class WikiDocumentCreate(APIModel):
+    title: str = Field(min_length=1, max_length=300)
+    content: str = Field(min_length=1, max_length=500_000)
+    tags: list[str] = Field(default_factory=list, max_length=30)
+    status: Literal["draft", "published"] = "published"
+
+
+class WikiDocumentUpdate(APIModel):
+    title: str | None = Field(default=None, min_length=1, max_length=300)
+    content: str | None = Field(default=None, min_length=1, max_length=500_000)
+    tags: list[str] | None = Field(default=None, max_length=30)
+    status: Literal["draft", "published"] | None = None
+
+
+class WikiDocumentRead(APIModel):
+    id: str
+    title: str
+    content: str
+    tags: list[str]
+    status: str
+    version: int
+    chunk_count: int
+    created_at: datetime
+    updated_at: datetime
+
+
+class WikiSearchRequest(APIModel):
+    query: str = Field(min_length=1, max_length=4000)
+    limit: int = Field(default=6, ge=1, le=20)
+
+
+class WikiSearchResult(APIModel):
+    document_id: str
+    title: str
+    heading: str | None
+    excerpt: str
+    score: float
+    version: int
+
+
 QueryPackName = Literal[
     "service_health",
     "runtime_resource",
@@ -379,3 +461,17 @@ class QueryPackPlan(APIModel):
 
 class InvestigationRefinement(APIModel):
     query_packs: list[QueryPackName] = Field(default_factory=list, max_length=7)
+
+
+class ReActDecision(APIModel):
+    action: Literal["query", "finish"]
+    query_pack: QueryPackName | None = None
+    rationale: str = Field(min_length=1, max_length=500)
+
+    @model_validator(mode="after")
+    def validate_action(self) -> "ReActDecision":
+        if self.action == "query" and self.query_pack is None:
+            raise ValueError("query action requires query_pack")
+        if self.action == "finish":
+            self.query_pack = None
+        return self

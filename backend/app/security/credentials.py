@@ -1,5 +1,6 @@
 import json
 import os
+import tempfile
 from pathlib import Path
 
 from cryptography.fernet import Fernet, InvalidToken
@@ -13,8 +14,20 @@ class CredentialVault:
         runtime_dir.mkdir(parents=True, exist_ok=True)
         key_path = runtime_dir / "credential.key"
         if not key_path.exists():
-            key_path.write_bytes(Fernet.generate_key())
-            os.chmod(key_path, 0o600)
+            descriptor, candidate_name = tempfile.mkstemp(
+                prefix=".credential.", suffix=".tmp", dir=runtime_dir
+            )
+            candidate_path = Path(candidate_name)
+            try:
+                os.fchmod(descriptor, 0o600)
+                with os.fdopen(descriptor, "wb") as key_file:
+                    key_file.write(Fernet.generate_key())
+                try:
+                    os.link(candidate_path, key_path)
+                except FileExistsError:
+                    pass
+            finally:
+                candidate_path.unlink(missing_ok=True)
         self._fernet = Fernet(key_path.read_bytes().strip())
 
     def encrypt(self, value: dict[str, str]) -> str:

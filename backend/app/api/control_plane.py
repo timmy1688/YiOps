@@ -2,16 +2,19 @@ import json
 import secrets
 from datetime import UTC, datetime
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
+import httpx
 from fastapi import APIRouter, HTTPException, Request, Response, status
 from fastapi.responses import StreamingResponse
 from tortoise.exceptions import IntegrityError
 from tortoise.transactions import in_transaction
 
+from app.api.dependencies import tenant_id as _tenant_id
+from app.api.sse import encode_sse
 from app.config import get_settings
-from app.connectors.kubeconfig import parse_kubeconfig
 from app.connectors.registry import registry as connector_registry
-from app.llm.deepseek import DeepSeekClient
+from app.llm.gateway import ModelGateway
 from app.models import (
     AlertEvent,
     AlertIntegration,
@@ -32,8 +35,6 @@ from app.schemas import (
     AnalysisModelConfigRead,
     AnalysisModelConfigUpsert,
     AnalysisRunRead,
-    ChatRequest,
-    ChatResponse,
     DatasourceCreate,
     DatasourceRead,
     DatasourceUpdate,
@@ -46,17 +47,12 @@ from app.schemas import (
     ToolExecutionRead,
 )
 from app.security.credentials import CredentialVault
-from app.security.tenant import DEFAULT_TENANT_ID, current_tenant_id, tenant_scope
-from app.services.chat import CHAT_TOOLS, ChatToolRunner
+from app.security.tenant import DEFAULT_TENANT_ID, tenant_scope
 from app.services.incidents import create_manual_incident, ingest_alertmanager
 
 router = APIRouter()
 settings = get_settings()
 credential_vault = CredentialVault()
-
-
-def _tenant_id() -> str:
-    return current_tenant_id() or DEFAULT_TENANT_ID
 
 
 @router.get("/health")
@@ -74,7 +70,7 @@ async def liveness() -> dict[str, str]:
 
 @router.get("/health/ready")
 async def readiness() -> dict[str, str]:
-    """Report that the API and its required database are ready."""
+    """Report that the API, database, and internal MCP service are ready."""
     try:
         await Incident.all().limit(1)
     except Exception as exc:
@@ -82,7 +78,18 @@ async def readiness() -> dict[str, str]:
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="database unavailable",
         ) from exc
-    return {"status": "ready", "database": "ok"}
+    mcp_url = urlsplit(settings.mcp_url)
+    mcp_health_url = urlunsplit((mcp_url.scheme, mcp_url.netloc, "/health", "", ""))
+    try:
+        async with httpx.AsyncClient(timeout=2.0, trust_env=False) as client:
+            response = await client.get(mcp_health_url)
+            response.raise_for_status()
+    except (httpx.HTTPError, ValueError) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="mcp unavailable",
+        ) from exc
+    return {"status": "ready", "database": "ok", "mcp": "ok"}
 
 
 @router.post("/webhooks/alertmanager", status_code=status.HTTP_202_ACCEPTED)
@@ -202,9 +209,7 @@ async def integration_webhook(
 
 @router.get("/model-configs", response_model=list[AnalysisModelConfigRead])
 async def list_model_configs() -> list[AnalysisModelConfigRead]:
-    items = await AnalysisModelConfig.filter(tenant_id=_tenant_id()).order_by(
-        "-enabled", "name"
-    )
+    items = await AnalysisModelConfig.filter(tenant_id=_tenant_id()).order_by("-enabled", "name")
     return [_model_config_read(item) for item in items]
 
 
@@ -225,9 +230,11 @@ async def create_model_config(
     try:
         async with in_transaction() as connection:
             if payload.enabled:
-                await AnalysisModelConfig.filter(
-                    tenant_id=_tenant_id(), enabled=True
-                ).using_db(connection).update(enabled=False)
+                await (
+                    AnalysisModelConfig.filter(tenant_id=_tenant_id(), enabled=True)
+                    .using_db(connection)
+                    .update(enabled=False)
+                )
             item = await AnalysisModelConfig.create(
                 id=new_id("model"),
                 tenant_id=_tenant_id(),
@@ -313,9 +320,7 @@ async def get_model_config() -> AnalysisModelConfigRead | None:
     )
     if item is None:
         item = (
-            await AnalysisModelConfig.filter(tenant_id=_tenant_id())
-            .order_by("created_at")
-            .first()
+            await AnalysisModelConfig.filter(tenant_id=_tenant_id()).order_by("created_at").first()
         )
     return _model_config_read(item) if item else None
 
@@ -331,9 +336,7 @@ async def upsert_model_config(
     )
     if item is None:
         item = (
-            await AnalysisModelConfig.filter(tenant_id=_tenant_id())
-            .order_by("created_at")
-            .first()
+            await AnalysisModelConfig.filter(tenant_id=_tenant_id()).order_by("created_at").first()
         )
     if item is None:
         return await create_model_config(payload)
@@ -349,9 +352,7 @@ async def test_model_config() -> dict[str, Any]:
     )
     if item is None:
         item = (
-            await AnalysisModelConfig.filter(tenant_id=_tenant_id())
-            .order_by("created_at")
-            .first()
+            await AnalysisModelConfig.filter(tenant_id=_tenant_id()).order_by("created_at").first()
         )
     if item is None or not item.secret_ref:
         raise HTTPException(status_code=404, detail="请先保存模型渠道和 API Key")
@@ -363,7 +364,7 @@ async def _test_model_config(item: AnalysisModelConfig) -> dict[str, Any]:
     if not credential:
         raise HTTPException(status_code=422, detail="API Key 无法读取，请重新填写")
     try:
-        message = await DeepSeekClient.test_connection(
+        message = await ModelGateway.test_connection(
             api_key=credential,
             base_url=item.base_url,
             model_name=item.model_name,
@@ -440,7 +441,7 @@ async def create_analysis_run(incident_id: str, request: Request) -> AnalysisRun
     if active is not None:
         return AnalysisRunRead.model_validate(active)
     run = await _new_analysis_run(incident_id)
-    await request.app.state.supervisor.enqueue(run.id)
+    await request.app.state.rca_supervisor.enqueue(run.id)
     return AnalysisRunRead.model_validate(run)
 
 
@@ -454,8 +455,8 @@ async def _new_analysis_run(incident_id: str) -> AnalysisRun:
         configured_model.model_name
         if configured_model and configured_model.secret_ref
         else (
-            settings.deepseek_model
-            if not settings.llm_mock_mode and settings.deepseek_api_key
+            settings.model_name
+            if not settings.llm_mock_mode and settings.model_api_key
             else "local-evidence-rules"
         )
     )
@@ -482,7 +483,7 @@ async def _enqueue_analysis_runs(
         if existing:
             continue
         run = await _new_analysis_run(incident.id)
-        await request.app.state.supervisor.enqueue(run.id)
+        await request.app.state.rca_supervisor.enqueue(run.id)
         run_ids.append(run.id)
     return run_ids
 
@@ -520,7 +521,7 @@ async def retry_analysis_run(run_id: str, request: Request) -> AnalysisRunRead:
     run.error_message = None
     run.completed_at = None
     await run.save()
-    await request.app.state.supervisor.enqueue(run.id)
+    await request.app.state.rca_supervisor.enqueue(run.id)
     return AnalysisRunRead.model_validate(run)
 
 
@@ -572,13 +573,13 @@ async def analysis_events(run_id: str, request: Request) -> StreamingResponse:
                 "progress": run.progress,
             },
         }
-        yield _sse(snapshot)
+        yield encode_sse(snapshot)
         if run.status in {"completed", "insufficient_evidence", "failed_final"}:
             return
         async for event in request.app.state.events.subscribe(run_id):
             if await request.is_disconnected():
                 break
-            yield _sse(event)
+            yield encode_sse(event)
             if event["event"] in {"report.completed", "run.failed"}:
                 break
 
@@ -607,30 +608,6 @@ async def create_feedback(report_id: str, payload: FeedbackCreate) -> FeedbackRe
     return FeedbackRead.model_validate(feedback)
 
 
-@router.post("/chat/completions", response_model=ChatResponse)
-async def create_chat_completion(payload: ChatRequest, request: Request) -> ChatResponse:
-    context = await _chat_context(payload.incident_id)
-    runner = ChatToolRunner(request.app.state.datasource_client)
-    try:
-        result = await DeepSeekClient(settings).chat(
-            [message.model_dump() for message in payload.messages],
-            context,
-            tools=CHAT_TOOLS,
-            tool_executor=runner.execute,
-        )
-    except Exception as exc:
-        raise HTTPException(
-            status_code=502,
-            detail=f"模型暂时无法回答：{str(exc)[:500]}",
-        ) from exc
-    return ChatResponse(
-        content=result.content,
-        model_name=result.model_name,
-        context_scope=str(context["scope"]),
-        tool_calls=result.tool_calls,
-    )
-
-
 @router.get("/datasources", response_model=list[DatasourceRead])
 async def list_datasources() -> list[DatasourceRead]:
     items = await DatasourceConfig.filter(tenant_id=_tenant_id()).order_by("name")
@@ -643,42 +620,19 @@ async def list_connector_types() -> list[dict[str, object]]:
 
 
 @router.post("/datasources", response_model=DatasourceRead, status_code=201)
-async def create_datasource(payload: DatasourceCreate, request: Request) -> DatasourceRead:
-    secret_ref = payload.secret_ref
+async def create_datasource(payload: DatasourceCreate) -> DatasourceRead:
     base_url = str(payload.base_url).rstrip("/") if payload.base_url else ""
-    datasource_settings = dict(payload.settings)
-    if payload.type == "kubernetes":
-        if payload.kubeconfig:
-            try:
-                parsed = parse_kubeconfig(payload.kubeconfig)
-            except ValueError as exc:
-                raise HTTPException(status_code=422, detail=str(exc)) from exc
-            base_url = parsed.server
-            datasource_settings.update(
-                {
-                    "cluster_id": parsed.cluster_id,
-                    "context_name": parsed.context_name,
-                    "default_namespace": parsed.namespace,
-                    "verify_ssl": parsed.verify_ssl,
-                    "credential_source": "kubeconfig",
-                }
-            )
-            secret_ref = request.app.state.datasource_client.vault.encrypt(parsed.credentials)
-        else:
-            cluster_id = str(payload.settings.get("cluster_id", "")).strip()
-            token = (payload.credential or payload.secret_ref or "").strip()
-            if not base_url or not cluster_id:
-                raise HTTPException(
-                    status_code=422,
-                    detail="请上传 kubeconfig，或填写 API Server 和集群标识",
-                )
-            if not token:
-                raise HTTPException(status_code=422, detail="Kubernetes Token 不能为空")
-            secret_ref = request.app.state.datasource_client.vault.encrypt(
-                {"token": token, "ca_cert": (payload.ca_cert or "").strip()}
-            )
-    elif not base_url:
+    if not base_url:
         raise HTTPException(status_code=422, detail="数据源地址不能为空")
+    datasource_settings = _datasource_settings(
+        payload.type, payload.settings, auth_type=payload.auth_type
+    )
+    secrets = _datasource_secrets(
+        payload.auth_type,
+        username=payload.username,
+        credential=payload.credential,
+    )
+    secret_ref = credential_vault.encrypt(secrets) if secrets else None
     item = await DatasourceConfig.create(
         id=new_id("ds"),
         tenant_id=_tenant_id(),
@@ -696,51 +650,99 @@ async def create_datasource(payload: DatasourceCreate, request: Request) -> Data
 async def update_datasource(
     datasource_id: str,
     payload: DatasourceUpdate,
-    request: Request,
 ) -> DatasourceRead:
     item = await DatasourceConfig.get_or_none(id=datasource_id, tenant_id=_tenant_id())
     if item is None:
         raise HTTPException(status_code=404, detail="Datasource not found")
     updates = payload.model_dump(exclude_unset=True)
-    kubeconfig = updates.pop("kubeconfig", None)
+    credential_supplied = "credential" in updates
     credential = updates.pop("credential", None)
-    ca_cert = updates.pop("ca_cert", None)
-    if item.type == "kubernetes":
-        legacy_credential = updates.pop("secret_ref", None)
-        if credential is None:
-            credential = legacy_credential
-    if kubeconfig is not None:
-        if item.type != "kubernetes":
-            raise HTTPException(status_code=422, detail="只有 Kubernetes 支持 kubeconfig")
-        try:
-            parsed = parse_kubeconfig(kubeconfig)
-        except ValueError as exc:
-            raise HTTPException(status_code=422, detail=str(exc)) from exc
-        updates["base_url"] = parsed.server
-        updates["settings"] = {
-            **item.settings,
-            "cluster_id": parsed.cluster_id,
-            "context_name": parsed.context_name,
-            "default_namespace": parsed.namespace,
-            "verify_ssl": parsed.verify_ssl,
-            "credential_source": "kubeconfig",
-        }
-        updates["secret_ref"] = request.app.state.datasource_client.vault.encrypt(
-            parsed.credentials
-        )
+    username_supplied = "username" in updates
+    username = updates.pop("username", None)
+    auth_type = updates.pop("auth_type", None) or str(item.settings.get("auth_type", "none"))
     if "base_url" in updates:
         updates["base_url"] = str(updates["base_url"]).rstrip("/")
-    if item.type == "kubernetes" and (credential is not None or ca_cert is not None):
-        existing = request.app.state.datasource_client.vault.decrypt(item.secret_ref)
-        if credential is not None:
-            existing["token"] = credential.strip()
-        if ca_cert is not None:
-            existing["ca_cert"] = ca_cert.strip()
-        updates["secret_ref"] = request.app.state.datasource_client.vault.encrypt(existing)
+    if "settings" in updates:
+        updates["settings"] = _datasource_settings(
+            item.type,
+            {**item.settings, **updates["settings"]},
+            auth_type=auth_type,
+        )
+    else:
+        updates["settings"] = _datasource_settings(item.type, item.settings, auth_type=auth_type)
+    existing = credential_vault.decrypt(item.secret_ref)
+    if auth_type == "none":
+        updates["secret_ref"] = None
+    elif credential_supplied or username_supplied or auth_type != item.settings.get("auth_type"):
+        secrets = _datasource_secrets(
+            auth_type,
+            username=username if username_supplied else existing.get("username"),
+            credential=credential
+            if credential_supplied
+            else _existing_credential(auth_type, existing),
+        )
+        updates["secret_ref"] = credential_vault.encrypt(secrets)
     for key, value in updates.items():
         setattr(item, key, value)
     await item.save()
     return _datasource_read(item)
+
+
+def _datasource_settings(
+    datasource_type: str,
+    raw_settings: dict[str, Any],
+    *,
+    auth_type: str,
+) -> dict[str, Any]:
+    settings: dict[str, Any] = {
+        "auth_type": auth_type,
+        "verify_ssl": bool(raw_settings.get("verify_ssl", True)),
+    }
+    tenant_id = str(raw_settings.get("tenant_id", "")).strip()
+    if datasource_type in {"prometheus", "loki", "tempo"} and tenant_id:
+        settings["tenant_id"] = tenant_id
+    if datasource_type == "elasticsearch":
+        settings["index_alias"] = str(raw_settings.get("index_alias", "logs-*")).strip() or "logs-*"
+    if datasource_type == "kubernetes":
+        cluster_id = str(raw_settings.get("cluster_id", "")).strip()
+        if not cluster_id:
+            raise HTTPException(status_code=422, detail="Kubernetes 集群标识不能为空")
+        settings["cluster_id"] = cluster_id
+        settings["default_namespace"] = str(raw_settings.get("default_namespace", "")).strip()
+    return settings
+
+
+def _datasource_secrets(
+    auth_type: str,
+    *,
+    username: str | None,
+    credential: str | None,
+) -> dict[str, str]:
+    value = (credential or "").strip()
+    if auth_type == "none":
+        return {}
+    if auth_type == "bearer":
+        if not value:
+            raise HTTPException(status_code=422, detail="Bearer Token 不能为空")
+        return {"token": value}
+    if auth_type == "basic":
+        user = (username or "").strip()
+        if not user or not value:
+            raise HTTPException(status_code=422, detail="Basic Auth 用户名和密码不能为空")
+        return {"username": user, "password": value}
+    if auth_type == "api_key":
+        if not value:
+            raise HTTPException(status_code=422, detail="API Key 不能为空")
+        return {"api_key": value}
+    raise HTTPException(status_code=422, detail="不支持的数据源认证类型")
+
+
+def _existing_credential(auth_type: str, secrets: dict[str, str]) -> str | None:
+    return {
+        "bearer": secrets.get("token"),
+        "basic": secrets.get("password"),
+        "api_key": secrets.get("api_key"),
+    }.get(auth_type)
 
 
 @router.delete(
@@ -760,7 +762,7 @@ async def test_datasource(datasource_id: str, request: Request) -> dict[str, Any
     item = await DatasourceConfig.get_or_none(id=datasource_id, tenant_id=_tenant_id())
     if item is None:
         raise HTTPException(status_code=404, detail="Datasource not found")
-    ok, message = await request.app.state.datasource_client.test_connection(item)
+    ok, message = await request.app.state.datasource_gateway.test_connection(item)
     item.last_test_status = "healthy" if ok else "failed"
     item.last_tested_at = datetime.now(UTC)
     await item.save(update_fields=["last_test_status", "last_tested_at", "updated_at"])
@@ -788,104 +790,6 @@ async def _incident_read(incident: Incident) -> IncidentRead:
     )
 
 
-async def _chat_context(incident_id: str | None) -> dict[str, object]:
-    datasources = await DatasourceConfig.filter(
-        tenant_id=_tenant_id(), enabled=True
-    ).order_by("type", "name")
-    available_datasources = [
-        {
-            "name": item.name,
-            "type": item.type,
-            "settings": {
-                key: value
-                for key, value in item.settings.items()
-                if key in {"cluster_id", "default_namespace", "index_alias"}
-            },
-        }
-        for item in datasources
-    ]
-    if incident_id:
-        incident = await Incident.get_or_none(id=incident_id, tenant_id=_tenant_id())
-        if incident is None:
-            raise HTTPException(status_code=404, detail="Incident not found")
-        latest_run = (
-            await AnalysisRun.filter(incident_id=incident.id).order_by("-created_at").first()
-        )
-        context: dict[str, object] = {
-            "scope": "incident",
-            "available_datasources": available_datasources,
-            "incident": {
-                "id": incident.id,
-                "title": incident.title,
-                "service": incident.service,
-                "cluster": incident.cluster,
-                "namespace": incident.namespace,
-                "severity": incident.severity,
-                "status": incident.status,
-                "started_at": incident.started_at.isoformat(),
-                "ended_at": incident.ended_at.isoformat() if incident.ended_at else None,
-                "alert_count": incident.alert_count,
-            },
-        }
-        if latest_run:
-            context["analysis"] = {
-                "status": latest_run.status,
-                "current_step": latest_run.current_step,
-                "progress": latest_run.progress,
-                "model_name": latest_run.model_name,
-                "error_message": latest_run.error_message,
-            }
-            evidence = await EvidenceItem.filter(analysis_run_id=latest_run.id).order_by(
-                "-quality"
-            ).limit(min(settings.max_evidence_items, 20))
-            context["evidence"] = [
-                {
-                    "id": item.id,
-                    "source": item.source,
-                    "type": item.type,
-                    "title": item.title,
-                    "summary": item.summary,
-                    "observed_at": item.observed_at.isoformat() if item.observed_at else None,
-                    "quality": item.quality,
-                    "values": item.values,
-                }
-                for item in evidence
-            ]
-            report = await RootCauseReport.get_or_none(analysis_run_id=latest_run.id)
-            if report:
-                context["report"] = {
-                    "status": report.status,
-                    "summary": report.summary,
-                    "confidence": report.confidence,
-                    "hypotheses": report.hypotheses,
-                    "recommended_actions": report.recommended_actions,
-                    "missing_evidence": report.missing_evidence,
-                }
-        return context
-
-    incidents = (
-        await Incident.filter(tenant_id=_tenant_id()).order_by("-started_at").limit(20)
-    )
-    return {
-        "scope": "overview",
-        "available_datasources": available_datasources,
-        "recent_incidents": [
-            {
-                "id": item.id,
-                "title": item.title,
-                "service": item.service,
-                "cluster": item.cluster,
-                "namespace": item.namespace,
-                "severity": item.severity,
-                "status": item.status,
-                "started_at": item.started_at.isoformat(),
-                "alert_count": item.alert_count,
-            }
-            for item in incidents
-        ],
-    }
-
-
 def _is_test_alert(alert: AlertEvent | None) -> bool:
     if alert is None:
         return False
@@ -900,11 +804,14 @@ def _is_test_alert(alert: AlertEvent | None) -> bool:
 
 
 def _datasource_read(item: DatasourceConfig) -> DatasourceRead:
+    secrets = credential_vault.decrypt(item.secret_ref)
     return DatasourceRead(
         id=item.id,
         name=item.name,
         type=item.type,
         base_url=item.base_url,
+        auth_type=str(item.settings.get("auth_type", "none")),
+        username=secrets.get("username"),
         secret_configured=bool(item.secret_ref),
         settings=item.settings,
         enabled=item.enabled,
@@ -944,7 +851,3 @@ def _model_config_read(item: AnalysisModelConfig) -> AnalysisModelConfigRead:
         created_at=item.created_at,
         updated_at=item.updated_at,
     )
-
-
-def _sse(payload: dict[str, Any]) -> str:
-    return f"event: {payload['event']}\ndata: {json.dumps(payload['data'], ensure_ascii=False)}\n\n"

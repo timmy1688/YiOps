@@ -6,10 +6,13 @@ from typing import Any, TypedDict
 
 from langgraph.graph import END, START, StateGraph
 
+from app.agents.query_catalog import TEMPLATES_BY_ID, templates_for_packs
 from app.analysis.evidence import build_evidence
 from app.config import Settings
-from app.connectors.client import DatasourceClient
-from app.llm.deepseek import DeepSeekClient
+from app.connectors.protocol import DatasourceGatewayProtocol
+from app.llm.gateway import ModelGateway
+from app.memory.context import fit_react_context
+from app.memory.wiki import WikiMemory
 from app.models import (
     AlertEvent,
     AnalysisRun,
@@ -22,7 +25,6 @@ from app.models import (
 from app.runtime.events import EventBroker
 from app.schemas import RootCauseOutput
 from app.security.tenant import set_tenant_id
-from app.tools.catalog import TEMPLATES_BY_ID, templates_for_packs
 
 
 class AgentState(TypedDict, total=False):
@@ -33,6 +35,10 @@ class AgentState(TypedDict, total=False):
     collection_summary: list[dict[str, Any]]
     evidence: list[dict[str, Any]]
     report: dict[str, Any]
+    memory: list[dict[str, Any]]
+    used_packs: list[str]
+    react_round: int
+    react_action: dict[str, Any]
 
 
 STEP_PROGRESS = {
@@ -44,39 +50,43 @@ STEP_PROGRESS = {
     "analyze": 0.85,
     "validate": 0.94,
     "save": 1.0,
+    "react": 0.25,
+    "act": 0.52,
 }
 
 
-class AnalysisAgent:
+class RcaAgent:
     def __init__(
         self,
         settings: Settings,
-        datasource_client: DatasourceClient,
-        llm: DeepSeekClient,
+        datasource_gateway: DatasourceGatewayProtocol,
+        model_gateway: ModelGateway,
         events: EventBroker,
+        memory: WikiMemory | None = None,
     ) -> None:
         self.settings = settings
-        self.datasource_client = datasource_client
-        self.llm = llm
+        self.datasource_gateway = datasource_gateway
+        self.model_gateway = model_gateway
         self.events = events
+        self.memory = memory or WikiMemory(settings)
         self.graph = self._build_graph()
 
     def _build_graph(self):
         builder = StateGraph(AgentState)
         builder.add_node("normalize", self._normalize)
-        builder.add_node("plan", self._plan)
-        builder.add_node("collect", self._collect)
-        builder.add_node("compress", self._compress)
-        builder.add_node("refine", self._refine)
+        builder.add_node("react", self._react)
+        builder.add_node("act", self._act)
         builder.add_node("analyze", self._analyze)
         builder.add_node("validate", self._validate)
         builder.add_node("save", self._save)
         builder.add_edge(START, "normalize")
-        builder.add_edge("normalize", "plan")
-        builder.add_edge("plan", "collect")
-        builder.add_edge("collect", "compress")
-        builder.add_edge("compress", "refine")
-        builder.add_edge("refine", "analyze")
+        builder.add_edge("normalize", "react")
+        builder.add_conditional_edges(
+            "react",
+            self._route_react,
+            {"act": "act", "analyze": "analyze"},
+        )
+        builder.add_edge("act", "react")
         builder.add_edge("analyze", "validate")
         builder.add_edge("validate", "save")
         builder.add_edge("save", END)
@@ -105,9 +115,7 @@ class AnalysisAgent:
                 "severity": incident.severity,
                 "source": latest_alert.source if latest_alert is not None else None,
                 "labels": dict(latest_alert.labels) if latest_alert is not None else {},
-                "annotations": (
-                    dict(latest_alert.annotations) if latest_alert is not None else {}
-                ),
+                "annotations": (dict(latest_alert.annotations) if latest_alert is not None else {}),
                 "alert_count": incident.alert_count,
                 "is_test": self._is_test_alert(latest_alert),
                 "started_at": incident.started_at.isoformat(),
@@ -170,8 +178,130 @@ class AnalysisAgent:
     async def _normalize(self, state: AgentState) -> AgentState:
         run_id = state["run_id"]
         await self._mark(run_id, "normalize")
+        query = " ".join(
+            str(state["incident"].get(key, ""))
+            for key in ("title", "alert_name", "service", "cluster", "namespace", "annotations")
+        )
+        memory = [item.public_dict() for item in await self.memory.retrieve(query)]
+        run = await AnalysisRun.get(id=run_id)
+        saved_plan = dict(run.investigation_plan or {})
+        used_packs = [
+            str(value) for value in saved_plan.get("query_packs", []) if isinstance(value, str)
+        ]
+        iterations = saved_plan.get("iterations", [])
+        react_round = len(iterations) if isinstance(iterations, list) else 0
+        evidence = await self._load_evidence(run_id, state["incident"])
+        executions = await ToolExecution.filter(analysis_run_id=run_id).all()
+        collection_summary = _collection_summary(
+            [
+                {
+                    "template_id": item.template_id,
+                    "source": item.source,
+                    "status": item.status,
+                    "result_count": item.result_count,
+                    "error_code": item.error_code,
+                }
+                for item in executions
+            ]
+        )
         await self._complete_step(run_id, "normalize")
-        return {"incident": state["incident"]}
+        return {
+            "incident": state["incident"],
+            "memory": memory,
+            "used_packs": used_packs,
+            "react_round": react_round,
+            "evidence": evidence,
+            "collection_summary": collection_summary,
+        }
+
+    async def _react(self, state: AgentState) -> AgentState:
+        run_id = state["run_id"]
+        await self._mark(run_id, "react")
+        used_packs = list(state.get("used_packs", []))
+        react_round = int(state.get("react_round", 0))
+        available = sorted(set(TEMPLATES_BY_ID[item].query_pack for item in TEMPLATES_BY_ID))
+        if react_round >= self.settings.agent_max_react_rounds or len(used_packs) >= len(available):
+            action = {
+                "action": "finish",
+                "query_pack": None,
+                "rationale": "已达到 ReAct 调查轮次上限或查询包已用尽。",
+            }
+            token_usage = (0, 0)
+        else:
+            context = fit_react_context(
+                incident=state["incident"],
+                evidence=state.get("evidence", []),
+                collection_summary=state.get("collection_summary", []),
+                memories=state.get("memory", []),
+                used_packs=used_packs,
+                max_tokens=self.settings.agent_max_context_tokens,
+            )
+            result = await self.model_gateway.react(context, available_query_packs=available)
+            action = result.value.model_dump(mode="json")
+            token_usage = (result.input_tokens, result.output_tokens)
+        run = await AnalysisRun.get(id=run_id)
+        plan = dict(run.investigation_plan or {"mode": "react", "iterations": []})
+        iterations = list(plan.get("iterations", []))
+        iterations.append({"round": react_round + 1, **action})
+        memory_refs = [
+            {key: item.get(key) for key in ("document_id", "title", "heading", "score", "version")}
+            for item in state.get("memory", [])
+        ]
+        plan.update(
+            {
+                "mode": "react",
+                "iterations": iterations,
+                "query_packs": used_packs,
+                "retrieved_memory": memory_refs,
+            }
+        )
+        run.investigation_plan = plan
+        run.input_tokens += token_usage[0]
+        run.output_tokens += token_usage[1]
+        await run.save(update_fields=["investigation_plan", "input_tokens", "output_tokens"])
+        await self.events.publish(run_id, "react.decision", iterations[-1])
+        await self._complete_step(run_id, "react")
+        return {"react_action": action, "react_round": react_round + 1}
+
+    @staticmethod
+    def _route_react(state: AgentState) -> str:
+        return "act" if state.get("react_action", {}).get("action") == "query" else "analyze"
+
+    async def _act(self, state: AgentState) -> AgentState:
+        run_id = state["run_id"]
+        await self._mark(run_id, "act")
+        query_pack = str(state["react_action"].get("query_pack", ""))
+        if not query_pack or query_pack in state.get("used_packs", []):
+            raise ValueError("ReAct selected an empty or repeated query pack")
+        results = await self._collect_query_packs(run_id, state["incident"], [query_pack])
+        await self._store_evidence(run_id, state["incident"], results)
+        evidence = await self._load_evidence(run_id, state["incident"])
+        memory_query = " ".join(
+            [
+                str(state["incident"].get("title", "")),
+                str(state["incident"].get("service", "")),
+                *[str(item.get("summary", ""))[:800] for item in evidence[:8]],
+            ]
+        )
+        refreshed_memory = [item.public_dict() for item in await self.memory.retrieve(memory_query)]
+        used_packs = [*state.get("used_packs", []), query_pack]
+        collection_summary = [
+            *state.get("collection_summary", []),
+            *_collection_summary(results),
+        ]
+        run = await AnalysisRun.get(id=run_id)
+        plan = dict(run.investigation_plan or {})
+        plan["query_packs"] = used_packs
+        run.investigation_plan = plan
+        await run.save(update_fields=["investigation_plan"])
+        await self._complete_step(run_id, "act")
+        return {
+            "tool_results": results,
+            "evidence": evidence,
+            "used_packs": used_packs,
+            "collection_summary": collection_summary,
+            "memory": refreshed_memory,
+        }
 
     async def _plan(self, state: AgentState) -> AgentState:
         run_id = state["run_id"]
@@ -180,7 +310,7 @@ class AnalysisAgent:
         if run.investigation_plan:
             plan = dict(run.investigation_plan)
         else:
-            result = await self.llm.plan(state["incident"])
+            result = await self.model_gateway.plan(state["incident"])
             packs = list(dict.fromkeys(result.value.query_packs))
             plan = {"query_packs": packs}
             run.investigation_plan = plan
@@ -258,7 +388,7 @@ class AnalysisAgent:
             "tool.started",
             {"template_id": template.id, "source": template.source},
         )
-        result = await self.datasource_client.execute(
+        result = await self.datasource_gateway.execute(
             template,
             service=service,
             cluster=cluster,
@@ -394,16 +524,14 @@ class AnalysisAgent:
         run_id = state["run_id"]
         await self._mark(run_id, "refine")
         used_packs = list(state["plan"]["query_packs"])
-        result = await self.llm.refine(
+        result = await self.model_gateway.refine(
             state["incident"],
             state.get("evidence", []),
             used_packs,
             state.get("collection_summary", []),
         )
         additional_packs = [
-            pack
-            for pack in dict.fromkeys(result.value.query_packs)
-            if pack not in used_packs
+            pack for pack in dict.fromkeys(result.value.query_packs) if pack not in used_packs
         ]
         run = await AnalysisRun.get(id=run_id)
         run.input_tokens += result.input_tokens
@@ -441,10 +569,19 @@ class AnalysisAgent:
         if existing is not None:
             report = _report_to_output(existing).model_dump(mode="json")
         else:
-            result = await self.llm.analyze(
-                state["incident"],
-                state.get("evidence", []),
+            context = fit_react_context(
+                incident=state["incident"],
+                evidence=state.get("evidence", []),
                 collection_summary=state.get("collection_summary", []),
+                memories=state.get("memory", []),
+                used_packs=state.get("used_packs", []),
+                max_tokens=self.settings.agent_max_context_tokens,
+            )
+            result = await self.model_gateway.analyze(
+                context["incident"],
+                context["evidence"],
+                collection_summary=context["collection_summary"],
+                memory=context["retrieved_memory"],
             )
             report = result.value.model_dump(mode="json")
             run = await AnalysisRun.get(id=run_id)
@@ -460,10 +597,19 @@ class AnalysisAgent:
         report = RootCauseOutput.model_validate(state["report"])
         error = _report_validation_error(report, state.get("evidence", []))
         if error:
-            result = await self.llm.analyze(
-                state["incident"],
-                state.get("evidence", []),
+            context = fit_react_context(
+                incident=state["incident"],
+                evidence=state.get("evidence", []),
                 collection_summary=state.get("collection_summary", []),
+                memories=state.get("memory", []),
+                used_packs=state.get("used_packs", []),
+                max_tokens=self.settings.agent_max_context_tokens,
+            )
+            result = await self.model_gateway.analyze(
+                context["incident"],
+                context["evidence"],
+                collection_summary=context["collection_summary"],
+                memory=context["retrieved_memory"],
                 validation_error=error,
             )
             report = result.value
@@ -598,9 +744,7 @@ def _calibrate_confidence(
     else:
         report.confidence = min(report.confidence, 0.2)
 
-    source_count = len(
-        {str(item.get("source", "")) for item in evidence if item.get("source")}
-    )
+    source_count = len({str(item.get("source", "")) for item in evidence if item.get("source")})
     boundary = "缺少跨数据源交叉验证"
     if report.hypotheses and source_count < 2 and boundary not in report.missing_evidence:
         report.missing_evidence.append(boundary)
@@ -609,11 +753,7 @@ def _calibrate_confidence(
 
 def _investigation_window(incident: dict[str, Any]) -> tuple[datetime, datetime]:
     started_at = _parse_datetime(str(incident["started_at"]))
-    ended_at = (
-        _parse_datetime(str(incident["ended_at"]))
-        if incident.get("ended_at")
-        else _utcnow()
-    )
+    ended_at = _parse_datetime(str(incident["ended_at"])) if incident.get("ended_at") else _utcnow()
     start = started_at - timedelta(minutes=60)
     minimum_end = started_at + timedelta(minutes=30)
     maximum_end = started_at + timedelta(hours=6)

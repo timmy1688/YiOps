@@ -4,7 +4,7 @@ from typing import Any
 
 import pytest
 
-from app.api import router
+from app.api import control_plane as router
 from app.services import incidents as incident_service
 
 
@@ -245,7 +245,7 @@ async def test_auto_analysis_is_enqueued_once_for_firing_incident(
     monkeypatch.setattr(router, "_new_analysis_run", new_analysis_run)
     supervisor = Supervisor()
     request = SimpleNamespace(
-        app=SimpleNamespace(state=SimpleNamespace(supervisor=supervisor))
+        app=SimpleNamespace(state=SimpleNamespace(rca_supervisor=supervisor))
     )
     incident = SimpleNamespace(id="incident-one", status="open")
     payload = {"status": "firing", "alerts": [{"status": "firing"}]}

@@ -20,6 +20,8 @@
 ## Deployment baseline
 
 - 使用只读数据源凭据和最小权限 Kubernetes ServiceAccount；
+- 不向宿主机或公网发布 `yiops-mcp` 的 8110 端口，仅允许 YiOps API 通过内部网络访问；
+- 为 `YIOPS_MCP_INTERNAL_TOKEN` 使用独立随机值并限制 `.env.docker` 的读取权限；
 - 保持身份认证开启，使用 HTTPS、Secure Cookie 和网络访问控制；
 - 保护 `.env.docker`、`.runtime/credential.key` 和数据库备份；
 - 限制 PromQL、LogQL、TraceQL 的查询范围与并发；
